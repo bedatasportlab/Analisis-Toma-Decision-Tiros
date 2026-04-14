@@ -1,0 +1,2684 @@
+---
+title: "Análisis de la finalización en primera división de La Liga española"
+author:
+  - Alonso González Romero
+  - Daniel López Paredes
+  - Alba Martínez de la Hermosa
+date: today
+format:
+  html:
+    page-layout: full  
+    css: style.css
+    embed-resources: true
+    plotly-connected: true
+    toc: true
+    toc-depth: 3
+    number-sections: true
+lang: es
+abstract: |
+  En este documento se lleva a cabo el análisis de las finalizaciones y se incluyen visualizaciones:
+  
+  - Obtención y procesamiento de los datos.
+  - Creación del DataFrame.
+  - Extracción de información nueva a partir de los datos.
+  - Creación de métricas básicas.
+  - Creación de métricas avanzadas.
+  - Análisis sobre las métricas básicas y avanzadas.
+---
+
+# Contexto y Objetivos del Análisis
+
+Las finalizaciones son un aspecto determinante en el fútbol de élite; la eficiencia en este aspecto marca a menudo la diferencia entre la victoria y la derrota. Si bien existen métricas consolidadas como el *Expected Goals* (xG) para medir la calidad de la ocasión, a menudo se ignoran factores contextuales críticos como la densidad defensiva o la visión del tirador.
+
+El presente análisis tiene como objetivo estudiar las finalizaciones en **LaLiga EA Sports (Temporada 2024/2025)** utilizando datos de **StatsBomb 360**. Al disponer de *freeze-frames* (la posición de todos los jugadores en el instante del tiro), es posible trascender el análisis tradicional y cuantificar geométricamente la dificultad de cada disparo.
+
+## Hoja de Ruta del Análisis
+
+La estructura del proyecto sigue un flujo de trabajo analítico incremental:
+
+1.  **Comprensión del Dato y Métricas Estándar:** Se realizará una exploración inicial para evaluar el volumen de tiros y goles. Se analizarán las métricas probabilísticas proporcionadas por StatsBomb (**xG** y **xGOT**) para detectar qué equipos y jugadores están rindiendo por encima o por debajo de lo esperado.
+
+2.  **Creación de nuevas métricas:** Se explotarán los datos 360 para crear nuevas variables.
+    * *Métricas Básicas:* Distancias, ángulos y conteo de jugadores en el cono de visión.
+    * *Métricas Avanzadas (Modelado de Visibilidad):* Se desarrollarán algoritmos para calcular el **Defensive Block Power** (bloqueo rival), **Shooter Visibility** (visión limpia) y **Open Goal** (portería vacía real).
+3.  **Análisis Estadístico Multivariante:** Se emplearán técnicas como *Scatter Plots* y **PCA (Análisis de Componentes Principales)** para validar las nuevas métricas y perfilar la identidad táctica de los equipos.
+
+## Línea futura de análisis
+
+Finalmente, se plantea una línea de análisis aplicada para estudiar el rol de los extremos en la finalización. Se pretende comparar la eficacia entre los **extremos a banda cambiada** (ej. zurdo en banda derecha) y los extremos naturales, evaluando si el perfil invertido genera situaciones de finalización de mayor calidad (xG y xGOT) al buscar ángulos interiores.
+
+# Importación de librerías
+
+A continuación se importan las librerías necesarias para trabajar con los datos de StatsBomb.
+
+```{python}
+# Importación de librerías
+import pandas as pd
+import json
+import mplsoccer
+from mplsoccer import Sbopen
+from mplsoccer import Sblocal
+from mplsoccer import Pitch
+from itables import show
+import plotly.graph_objects as go
+import numpy as np
+import os
+import math
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+import matplotlib.patches as patches
+import seaborn as sns
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+```
+
+# Preparación y limpieza de datos
+
+Para facilitar el análisis y manejar el gran volumen de datos de toda la temporada, se ha desarrollado un proceso de extracción, transformación y carga (ETL) automatizado mediante el script `etl_advanced.py`. Este proceso realiza las siguientes tareas para cada uno de los 380 partidos de la temporada:
+
+1.  **Carga de datos crudos**: Lee los archivos JSON originales de StatsBomb (eventos, datos 360, alineaciones, etc.).
+2.  **Filtrado de tiros**: Selecciona únicamente los eventos de tipo "Shot" con sus variables como:
+    - Las coordenadas desde donde se hizo y finalizó el tiro.
+    - La clasificación del tiro según su resultado.
+    - xG: la probabilidad de meter gol antes de realizar el tiro.
+    - xGOT: la probabilidad de meter gol una vez está hecho el tiro y este se dirige a la portería.
+    - Modo de golpeo (pie, cabeza...).
+3.  **Enriquecimiento con datos 360**: Realiza una unión (*merge*) entre los eventos de tiro y los *freeze frames* correspondientes. Esto asocia a cada tiro la posición de todos los jugadores visibles en ese instante.
+4.  **Cálculo de métricas espaciales**:
+    - Cuenta el número de compañeros, rivales y porteros visibles.
+    - Extrae y estructura las coordenadas (x, y) de cada jugador visible, junto con su id de jugador, en listas de objetos para su fácil manipulación.
+    A partir de estos datos se puede determinar si había presión o no.
+5.  **Consolidación**: Une la información de todos los partidos en un único DataFrame maestro (`all_shots_360_processed.parquet`) y guarda los datos intermedios de cada partido en formato parquet para un acceso rápido.
+
+Este enfoque nos permite trabajar directamente con un conjunto de datos limpio y estructurado (`shots_360_limpio`), donde cada fila representa un tiro a puerta con toda su información contextual asociada, listo para el análisis avanzado.
+
+```{python}
+# Importamos los datos de todos los partidos:
+df_matches = pd.read_parquet("data_processed/matches/all_matches.parquet")
+
+# Importamos los datos de todos los tiros 360 de la temporada 2024/2025 procesados:
+all_shots_360 = pd.read_parquet('data_processed/all_shots_360_processed.parquet')
+
+# Las columnas de posiciones vienen como strings JSON (para compatibilidad con parquet), 
+# así que las convertimos de nuevo a listas de diccionarios.
+cols_json = ['posiciones_compañeros', 'posiciones_rivales', 'posiciones_porteros']
+for col in cols_json:
+    all_shots_360[col] = all_shots_360[col].apply(lambda x: json.loads(x) if x else [])
+
+# Definimos el DataFrame principal de trabajo
+shots_360_limpio = all_shots_360.copy()
+
+# Dado un partido, cargamos los eventos, alineaciones y tácticas (opcional, para consultas específicas):
+match_id = df_matches.iloc[0]['match_id']
+
+# Hacemos un merge de shots_360_limpio con df_matches para sacar home_team y away_team
+shots_360_limpio = shots_360_limpio.merge(
+    df_matches[['match_id', 'home_team_name', 'away_team_name']],
+    on='match_id',
+    how='left'
+)
+
+# Ahora, vamos a definir quién es el equipo que defiende en cada tiro usando possesion_team_name y home/away team
+def get_defending_team(row):
+    if row['possession_team_name'] == row['home_team_name']:
+        return row['away_team_name']
+    else:
+        return row['home_team_name']
+
+shots_360_limpio['defending_team_name'] = shots_360_limpio.apply(get_defending_team, axis=1)
+
+# Ordenamos las columnas para mejorar la visualización
+cols_order = ['match_id', 'id', 'period', 'timestamp', 'home_team_name', 'away_team_name', 'possession_team_name', 'defending_team_name']
+
+cols_order += [col for col in shots_360_limpio.columns if col not in cols_order]
+
+shots_360_limpio = shots_360_limpio[cols_order]
+
+# Visualización de las primeras filas del dataset procesado
+shots_360_limpio.head()
+```
+
+## Calidad del análisis: comprobación del tipo de datos
+
+Una vez creado el DataFrame sobre el que se va a trabajar, se comprueba que los datos están en el formato necesario para su manipulación.
+
+```{python}
+# Crear DataFrame con columnas y tipos
+tipos_columnas = pd.DataFrame({
+    'columna': shots_360_limpio.columns,
+    'tipo': shots_360_limpio.dtypes.values
+})
+tipos_columnas = tipos_columnas.sort_values('tipo').reset_index(drop=True) # ordenar por tipo
+tipos_columnas
+```
+
+Puesto que todos los datos están en el formato adecuado, se elimina *tipos_columnas* para no sobrecargar el proyecto y se continúa con el análisis.
+
+```{python}
+del tipos_columnas
+```
+
+# Análisis inicial y primeras visualizaciones
+
+En este primer apartado, y partiendo de los datos ya procesados, el objetivo explorar y visualizar de manera básica los tiros a puerta en La Liga 2024/2025, junto con un análisis exploratorio simple acerca de las métricas base de StatsBomb (xG y xGOT).
+
+## Volumen de tiros y goles por equipo en La Liga 2024/2025
+
+A continuación, se presenta el resumen acumulado de tiros realizados y goles marcados por cada equipo en la temporada 2024/2025 de La Liga.
+
+```{python}
+#| label: tabla-resumen-equipos
+#| warning: false
+
+# Agrupamos por equipo atacante
+resumen_equipos = shots_360_limpio.groupby('possession_team_name').agg({
+    'id': 'count',            # Total de tiros
+    'is_goal': 'sum',         # Total de goles (excluyendo propia puerta)
+    'shot_statsbomb_xg': 'sum' # xG acumulado
+}).reset_index()
+
+resumen_equipos.columns = ['Equipo', 'Tiros Totales', 'Goles (Shot)', 'Goles Esperados (xG)']
+
+# Calculamos Goles por Tiro para ordenar
+resumen_equipos['Ratio Gol/Tiro'] = resumen_equipos['Goles (Shot)'] / resumen_equipos['Tiros Totales']
+resumen_equipos = resumen_equipos.sort_values('Goles (Shot)', ascending=False)
+
+# Mostrar tabla interactiva
+show(resumen_equipos, classes="display nowrap compact")
+```
+
+En esta tabla podemos observar que el equipo con más tiros y goles en la temporada es el **FC Barcelona**, seguido por el **Real Madrid**. Además, se incluye la métrica de **Ratio Gol/Tiro** (goles por tiro) para evaluar qué equipos son más efectivos en sus finalizaciones, observando que el **FC Barcelona** es el equipo con mejor ratio seguido del **Atlético de Madrid**. Cabe destacar que esta métrica de *Ratio Gol/Tiro* será útil más adelante para comparar la eficiencia de los equipos en función de nuevas métricas que se desarrollarán. 
+
+
+**Nota importante:** Es importante destacar que los totales de goles mostrados en este análisis corresponden estrictamente a eventos clasificados como Shot (Tiro) con resultado Goal. Esto implica que los **goles en propia puerta** no están contabilizados en estos totales, ya que StatsBomb los registra de otra manera distinta. Por tanto, puede existir una ligera discrepancia respecto a las tablas de clasificación oficiales.
+
+## Exploración Visual de las Finalizaciones
+
+Para comprender mejor la cantidad de información ofrecida por StatsBomb 360, vamos a visualizar los eventos de tiro utlizando distintas representaciones gráficas, que nos van a permitir analizar desde la trayectoria del balón hasta la zona de impacto con la red. En este apartado se consideran las siguientes visualizaciones:
+
+- Mapa de Tiros (2D) de un partido destacado (El Clásico): trayectoria del balón, posición del tiro y otro detalles.
+- Mapa de Tiros en la portería (3D) de un partido destacado (El Clásico): zona de impacto del balón en la portería.
+- Heatmap de tiros en la portería (3D) del Real Madrid durante la temporada.
+- Heatmap del campo de los tiros realizados por todos los equipos en La Liga 2024/2025 agrupado por zonas.
+- Heatmap de los tiros por zonas del campo. 
+- Mapa de tiros según sus características.
+
+
+### Mapa de Tiros de un partido destacado (El Clásico)
+
+En este apartado se visualizan los tiros a puerta de un partido destacado de la temporada: **El Clásico (FC Barcelona vs Real Madrid)**. Se utilizará una visualización interactiva que muestra el campo de juego, la posición de los tiros, sus trayectorias, el resultado (gol o no), el minuto en el que se realizó y el jugador que realizó el lanzamiento,  junto con los escudos de los equipos y el marcador final.
+
+```{python}
+
+# Cargar logos de los equipos
+df_logos = pd.read_parquet("data_processed/teams_logos.parquet")
+
+# Buscar el partido Real Madrid vs Barcelona (o viceversa)
+# Definimos los equipos para el ejemplo
+equipo_local = 'Real Madrid'
+equipo_visitante = 'Barcelona'
+
+# Función generalizada para Streamlit (Estilo La Liga - Medio Campo)
+def plot_match_shots_laliga_style(home_team, away_team, df_matches, df_shots, df_logos):
+    # 1. Buscar el partido (flexible en orden local/visitante)
+    match = df_matches[
+        ((df_matches['home_team_name'] == home_team) & (df_matches['away_team_name'] == away_team)) |
+        ((df_matches['home_team_name'] == away_team) & (df_matches['away_team_name'] == home_team))
+    ]
+    
+    if match.empty:
+        print(f"No se encontró partido entre {home_team} y {away_team}")
+        return go.Figure().update_layout(title="Partido no encontrado")
+
+    # Datos del partido encontrado
+    match_data = match.iloc[0]
+    match_id = match_data['match_id']
+    real_home = match_data['home_team_name']
+    real_away = match_data['away_team_name']
+    score_home = match_data['home_score']
+    score_away = match_data['away_score']
+
+    # 2. Filtrar tiros del partido
+    df_game_shots = df_shots[df_shots['match_id'] == match_id].copy()
+    
+    # 3. Obtener Logos
+    def get_logo(team_name):
+        res = df_logos[df_logos['team_name'] == team_name]['team_logo'].values
+        return res[0] if len(res) > 0 else ""
+    
+    logo_h = get_logo(real_home)
+    logo_a = get_logo(real_away)
+
+    # 4. Configuración de Colores (Neón Universal)
+    c_home = "#00BFFF" # Azul Neón (Deep Sky Blue)
+    c_away = "#00FF7F" # Verde Neón (Spring Green)
+
+    fig = go.Figure()
+    
+    # --- CAMPO DE JUEGO (Medio Campo Ofensivo, Fondo Oscuro) ---
+    # Fondo
+    fig.add_shape(type="rect", x0=60, y0=0, x1=120, y1=80, line=dict(width=0), fillcolor="#1e1e1e", layer="below")
+    line_color = "#dddddd"
+    
+    # Líneas del campo (Solo mitad derecha)
+    shapes = [
+        dict(type="rect", x0=60, y0=0, x1=120, y1=80, line=dict(color=line_color, width=2)), # Contorno
+        dict(type="line", x0=60, y0=0, x1=60, y1=80, line=dict(color=line_color, width=2)),   # Línea central
+        dict(type="path", path="M 60 30 A 10 10 0 0 1 60 50", line=dict(color=line_color, width=2)), # Círculo central
+        dict(type="rect", x0=102, y0=18, x1=120, y1=62, line=dict(color=line_color, width=2)), # Área grande
+        dict(type="rect", x0=114, y0=30, x1=120, y1=50, line=dict(color=line_color, width=2)), # Área pequeña
+        dict(type="rect", x0=120, y0=36, x1=122, y1=44, line=dict(color=line_color, width=2)), # Portería
+        dict(type="path", path="M 102 30 Q 96 40 102 50", line=dict(color=line_color, width=2)), # Arco penal
+    ]
+    for s in shapes: fig.add_shape(s)
+    # Punto penal
+    fig.add_trace(go.Scatter(x=[108], y=[40], mode='markers', marker=dict(color=line_color, size=4), showlegend=False, hoverinfo='skip'))
+
+    # --- TIROS ---
+    # Helper para formatear el minuto correctamente
+    def fmt_min(row):
+        # Usamos 'timestamp' ya que 'minute' no está disponible en este dataset
+        # El timestamp suele venir como "HH:MM:SS.mmm"
+        val = row.get('timestamp', '')
+        if isinstance(val, str):
+            # Intentamos limpiar los milisegundos si existen
+            return val.split('.')[0]
+        return val
+
+    # Iteramos por equipo (Local y Visitante)
+    for team, color in [(real_home, c_home), (real_away, c_away)]:
+        # Filtramos tiros en medio campo ofensivo (x >= 60)
+        ts = df_game_shots[(df_game_shots['team_name'] == team) & (df_game_shots['x'] >= 60)]
+        
+        # Trayectorias (Líneas)
+        x_l, y_l = [], []
+        for _, s in ts.iterrows():
+            x_l.extend([s['x'], s['end_x'], None])
+            y_l.extend([s['y'], s['end_y'], None])
+            
+        fig.add_trace(go.Scatter(
+            x=x_l, y=y_l, mode='lines', line=dict(color=color, width=1), opacity=0.3,
+            showlegend=False, legendgroup=team, hoverinfo='skip'
+        ))
+        
+        # Tiros (No Goles) - Tamaño proporcional al xG
+        ng = ts[ts['is_goal'] == 0]
+        # Normalizamos tamaño: min 6, max 18 según xG
+        sizes_ng = [6 + (xg * 15) for xg in ng['shot_statsbomb_xg']]
+        
+        fig.add_trace(go.Scatter(
+            x=ng['x'], y=ng['y'], mode='markers',
+            marker=dict(
+                color=color, 
+                size=sizes_ng, 
+                line=dict(color='white', width=1),
+                opacity=0.7
+            ),
+            name=team, legendgroup=team,
+            text=[f"<b>{r['player_name']}</b><br>Tiempo: {fmt_min(r)}<br>xG: {r['shot_statsbomb_xg']:.2f}<br>{r['outcome_name']}" for _, r in ng.iterrows()],
+            hoverinfo='text'
+        ))
+        
+        # Goles - Tamaño proporcional al xG
+        g = ts[ts['is_goal'] == 1]
+        sizes_g = [12 + (xg * 20) for xg in g['shot_statsbomb_xg']]
+        
+        fig.add_trace(go.Scatter(
+            x=g['x'], y=g['y'], mode='markers',
+            marker=dict(
+                color=color, 
+                size=sizes_g, 
+                symbol='star', 
+                line=dict(color='gold', width=2)
+            ),
+            name=f"{team} (Goles)", legendgroup=team,
+            text=[f"<b>Gol - {r['player_name']}</b><br>Tiempo: {fmt_min(r)}<br>xG: {r['shot_statsbomb_xg']:.2f}" for _, r in g.iterrows()],
+            hoverinfo='text'
+        ))
+        
+        # Trayectorias Goles (Destacadas)
+        x_gl, y_gl = [], []
+        for _, s in g.iterrows():
+            x_gl.extend([s['x'], s['end_x'], None])
+            y_gl.extend([s['y'], s['end_y'], None])
+        fig.add_trace(go.Scatter(
+            x=x_gl, y=y_gl, mode='lines', line=dict(color='gold', width=2, dash='dot'), opacity=0.9,
+            showlegend=False, legendgroup=team, hoverinfo='skip'
+        ))
+
+    # --- DECORACIÓN FINAL ---
+    # Logo La Liga (Marca de agua)
+    fig.add_layout_image(dict(
+        source="https://upload.wikimedia.org/wikipedia/commons/thumb/0/0f/LaLiga_logo_2023.svg/800px-LaLiga_logo_2023.svg.png",
+        xref="x", yref="y", x=90, y=40, sizex=20, sizey=20, opacity=0.1, layer="below", xanchor="center", yanchor="middle"
+    ))
+    
+    # Marcador
+    fig.add_annotation(
+        x=0.5, y=1.15, xref="paper", yref="paper",
+        text=f"<span style='font-size: 24px; font-family: Arial Black; color: white;'>{score_home}</span> <span style='color: #ccc;'>-</span> <span style='font-size: 24px; font-family: Arial Black; color: white;'>{score_away}</span>",
+        showarrow=False
+    )
+    # Nombres Equipos
+    fig.add_annotation(x=0.2, y=1.15, xref="paper", yref="paper", text=f"<b style='color: {c_home};'>{real_home}</b>", showarrow=False)
+    fig.add_annotation(x=0.8, y=1.15, xref="paper", yref="paper", text=f"<b style='color: {c_away};'>{real_away}</b>", showarrow=False)
+    
+    # Logos Equipos
+    if logo_h: fig.add_layout_image(dict(source=logo_h, xref="paper", yref="paper", x=0.12, y=1.18, sizex=0.1, sizey=0.1, xanchor="center", yanchor="top"))
+    if logo_a: fig.add_layout_image(dict(source=logo_a, xref="paper", yref="paper", x=0.88, y=1.18, sizex=0.1, sizey=0.1, xanchor="center", yanchor="top"))
+
+    fig.update_layout(
+        width=800, height=600, plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
+        margin=dict(t=100, b=20, l=20, r=20),
+        xaxis=dict(range=[60, 125], showgrid=False, visible=True, fixedrange=False), # Zoom habilitado
+        yaxis=dict(range=[-5, 85], showgrid=False, visible=True, scaleanchor="x", scaleratio=1, fixedrange=False), # Zoom habilitado
+        legend=dict(orientation="h", y=-0.05, x=0.5, xanchor="center", bgcolor="rgba(30,30,30,0.8)", font=dict(color="white")),
+        font=dict(family="Arial, sans-serif", color="white"),
+        dragmode='zoom' # Modo zoom por defecto
+    )
+    return fig
+
+# Generar y mostrar la figura usando la función generalizada
+fig_match = plot_match_shots_laliga_style(equipo_local, equipo_visitante, df_matches, shots_360_limpio, df_logos)
+fig_match.show()    
+```
+
+### Mapa de Tiros en la portería (3D) de un partido destacado (El Clásico)
+
+A continuación, se crea una visualización similar, pero en vez de mostrar la trayectoria del balón, se visualiza dónde impactaron los tiros en la portería (coordenadas Y y Z) para analizar la distribución de los tiros a puerta.
+
+```{python}
+# Función para visualizar tiros a puerta en la portería (3x3)
+def plot_goal_mouth_shots(home_team, away_team, df_matches, df_shots, df_logos):
+    # 1. Buscar el partido
+    match = df_matches[
+        ((df_matches['home_team_name'] == home_team) & (df_matches['away_team_name'] == away_team)) |
+        ((df_matches['home_team_name'] == away_team) & (df_matches['away_team_name'] == home_team))
+    ]
+    
+    if match.empty:
+        print(f"No se encontró partido entre {home_team} y {away_team}")
+        return go.Figure().update_layout(title="Partido no encontrado")
+
+    match_data = match.iloc[0]
+    match_id = match_data['match_id']
+    real_home = match_data['home_team_name']
+    real_away = match_data['away_team_name']
+    score_home = match_data['home_score']
+    score_away = match_data['away_score']
+    
+    # 2. Filtrar tiros del partido y que sean A PUERTA
+    # Tiros a puerta suelen ser: Goal, Saved, Saved to Post, Post (aunque Post a veces es fuera, lo incluiremos para ver dónde pegó)
+    outcomes_on_target = ['Goal', 'Saved', 'Saved to Post', 'Post']
+    
+    df_game_shots = df_shots[
+        (df_shots['match_id'] == match_id) & 
+        (df_shots['outcome_name'].isin(outcomes_on_target))
+    ].copy()
+    
+    # 3. Obtener Logos
+    def get_logo(team_name):
+        res = df_logos[df_logos['team_name'] == team_name]['team_logo'].values
+        return res[0] if len(res) > 0 else ""
+    
+    logo_h = get_logo(real_home)
+    logo_a = get_logo(real_away)
+
+    # Colores
+    c_home = "#00BFFF" # Azul Neón
+    c_away = "#00FF7F" # Verde Neón
+
+    fig = go.Figure()
+
+    # --- DIBUJO DE LA PORTERÍA REALISTA ---
+    # Dimensiones StatsBomb: Y (ancho) de 36 a 44. Z (alto) de 0 a 2.67
+    goal_y_min, goal_y_max = 36, 44
+    goal_z_max = 2.67
+    
+    # 1. Red (Patrón de cuadrícula densa para realismo)
+    # Líneas verticales
+    for i in np.linspace(goal_y_min, goal_y_max, 30):
+        fig.add_shape(type="line", x0=i, y0=0, x1=i, y1=goal_z_max, 
+                      line=dict(color="rgba(200,200,200,0.1)", width=1), layer="below")
+    # Líneas horizontales
+    for i in np.linspace(0, goal_z_max, 15):
+        fig.add_shape(type="line", x0=goal_y_min, y0=i, x1=goal_y_max, y1=i, 
+                      line=dict(color="rgba(200,200,200,0.1)", width=1), layer="below")
+                      
+    # 2. Postes y Larguero (Más gruesos y blancos sólidos)
+    # Poste Izquierdo
+    fig.add_shape(type="rect", x0=goal_y_min-0.15, y0=0, x1=goal_y_min, y1=goal_z_max+0.15, 
+                  line=dict(width=0), fillcolor="#F0F0F0")
+    # Poste Derecho
+    fig.add_shape(type="rect", x0=goal_y_max, y0=0, x1=goal_y_max+0.15, y1=goal_z_max+0.15, 
+                  line=dict(width=0), fillcolor="#F0F0F0")
+    # Larguero
+    fig.add_shape(type="rect", x0=goal_y_min-0.15, y0=goal_z_max, x1=goal_y_max+0.15, y1=goal_z_max+0.15, 
+                  line=dict(width=0), fillcolor="#F0F0F0")
+
+    # --- DIBUJO DE LOS TIROS ---
+    # Helper para extraer coordenadas Y, Z usando las columnas aplanadas
+    def get_end_coords(row):
+        y = row.get('end_y')
+        z = row.get('end_z')
+        if pd.isna(y): return None, None
+        if pd.isna(z): z = 0 # Asumimos raso si no hay altura
+        return y, z
+
+    # Acumuladores para estadísticas
+    stats_text = []
+
+    for team, color in [(real_home, c_home), (real_away, c_away)]:
+        team_shots = df_game_shots[df_game_shots['team_name'] == team]
+        
+        # Estadísticas
+        total_shots = len(team_shots)
+        total_xg = team_shots['shot_statsbomb_xg'].sum()
+        stats_text.append(f"<b>{team}</b><br>Tiros a puerta: {total_shots}<br>xG Total: {total_xg:.2f}")
+        
+        y_vals = []
+        z_vals = []
+        texts = []
+        sizes = []
+        symbols = []
+        colors = []
+        lines = []
+        
+        for _, shot in team_shots.iterrows():
+            y, z = get_end_coords(shot)
+            if y is not None:
+                y_vals.append(y)
+                z_vals.append(z)
+                
+                is_goal = shot['is_goal'] == 1
+                xg = shot['shot_statsbomb_xg']
+                
+                # Texto tooltip
+                minuto = shot.get('timestamp', '').split('.')[0] if isinstance(shot.get('timestamp'), str) else shot.get('minute', '')
+                texts.append(f"<b>{shot['player_name']}</b><br>{shot['outcome_name']}<br>xG: {xg:.2f}<br>Min: {minuto}")
+                
+                # Estilo: Círculos para tiros, Estrellas para goles
+                sizes.append(12 + (xg * 15)) # Tamaño según xG
+                symbols.append('star' if is_goal else 'circle')
+                colors.append(color)
+                lines.append('gold' if is_goal else 'white')
+
+        fig.add_trace(go.Scatter(
+            x=y_vals, y=z_vals,
+            mode='markers',
+            marker=dict(
+                color=colors,
+                size=sizes,
+                symbol=symbols,
+                line=dict(color=lines, width=2),
+                opacity=0.9
+            ),
+            name=team,
+            text=texts,
+            hoverinfo='text'
+        ))
+
+    # --- DECORACIÓN ---
+    # Logo La Liga (Marca de agua central en la portería)
+    fig.add_layout_image(dict(
+        source="https://upload.wikimedia.org/wikipedia/commons/thumb/0/0f/LaLiga_logo_2023.svg/800px-LaLiga_logo_2023.svg.png",
+        xref="x", yref="y", x=40, y=1.3, sizex=4, sizey=4, opacity=0.15, layer="below", xanchor="center", yanchor="middle"
+    ))
+
+    # Marcador Grande
+    fig.add_annotation(
+        x=0.5, y=1.22, xref="paper", yref="paper",
+        text=f"<span style='font-size: 32px; font-family: Arial Black; color: white;'>{score_home} - {score_away}</span>",
+        showarrow=False
+    )
+    
+    # Estadísticas en las esquinas
+    fig.add_annotation(x=0.0, y=1.15, xref="paper", yref="paper", text=stats_text[0], showarrow=False, align="left", font=dict(color=c_home, size=12))
+    fig.add_annotation(x=1.0, y=1.15, xref="paper", yref="paper", text=stats_text[1], showarrow=False, align="right", font=dict(color=c_away, size=12))
+
+    # Logos Equipos
+    if logo_h: fig.add_layout_image(dict(source=logo_h, xref="paper", yref="paper", x=0.15, y=1.28, sizex=0.12, sizey=0.12, xanchor="center", yanchor="top"))
+    if logo_a: fig.add_layout_image(dict(source=logo_a, xref="paper", yref="paper", x=0.85, y=1.28, sizex=0.12, sizey=0.12, xanchor="center", yanchor="top"))
+
+    fig.update_layout(
+        title=dict(text="<b>Análisis de Tiros a Puerta</b>", y=0.98, x=0.5, xanchor='center', font=dict(color="white", size=16)),
+        plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
+        xaxis=dict(range=[34, 46], showgrid=False, visible=False, fixedrange=False), # Zoom habilitado
+        yaxis=dict(range=[-0.5, 3.5], showgrid=False, visible=False, scaleanchor="x", scaleratio=1, fixedrange=False), # Zoom habilitado
+        legend=dict(orientation="h", y=-0.1, x=0.5, xanchor="center", font=dict(color="white")),
+        font=dict(family="Arial, sans-serif", color="white"),
+        margin=dict(t=130, b=40, l=40, r=40),
+        width=800, height=550,
+        dragmode='zoom'
+    )
+
+    return fig
+
+# Ejecutar visualización
+fig_goal = plot_goal_mouth_shots(equipo_local, equipo_visitante, df_matches, shots_360_limpio, df_logos)
+fig_goal.show()
+```
+
+### Heatmap de tiros en la portería (3D) del Real Madrid durante la temporada
+
+A continuación, se muestra el conteo de tiros que llegaron a línea de fondo del Real Madrid durante la temporada. Además, la portería ha sido dividida en 9 zonas (3x3) para analizar la distribución de los tiros.
+
+```{python}
+# 6. Función de Heatmap de Tiros a Puerta (Grid 3x3 + Exterior)
+def plot_goal_mouth_heatmap(df_shots, df_matches=None, df_logos=None, match_ids=None, team_name=None, only_goals=False, n_cols_inside=3, n_rows_inside=3):
+    """
+    Genera un heatmap basado en cuadrícula (Grid) de la distribución de tiros.
+    Divide la portería en n_cols x n_rows zonas internas, más zonas externas.
+    """
+    
+    # 1. Filtrado de Datos
+    df_filtered = df_shots.copy()
+    
+    if match_ids is not None:
+        if isinstance(match_ids, (int, str)): match_ids = [match_ids]
+        df_filtered = df_filtered[df_filtered['match_id'].isin(match_ids)]
+        
+    if team_name is not None:
+        df_filtered = df_filtered[df_filtered['team_name'] == team_name]
+        
+    outcomes_on_target = ['Goal', 'Saved', 'Saved to Post', 'Post']
+    if only_goals:
+        df_filtered = df_filtered[df_filtered['outcome_name'] == 'Goal']
+    else:
+        df_filtered = df_filtered[df_filtered['outcome_name'].isin(outcomes_on_target)]
+        
+    if df_filtered.empty:
+        print("No hay datos para los filtros seleccionados.")
+        return go.Figure().update_layout(title="Sin datos", plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e', font=dict(color="white"))
+
+    # 2. Extracción de Coordenadas
+    def get_coords(row):
+        y = row.get('end_y')
+        z = row.get('end_z')
+        if pd.isna(y): return None, None
+        if pd.isna(z): z = 0
+        return y, z
+        
+    coords = df_filtered.apply(get_coords, axis=1, result_type='expand')
+    y_vals = coords[0].dropna()
+    z_vals = coords[1].dropna()
+
+    # 3. Definición del Grid (Bins)
+    # Portería: Y=[36, 44], Z=[0, 2.67]
+    # Zonas internas
+    y_inner = np.linspace(36, 44, n_cols_inside + 1)
+    z_inner = np.linspace(0, 2.67, n_rows_inside + 1)
+    
+    # Zonas externas (Laterales y Arriba)
+    # Añadimos una zona a la izquierda (30-36), una a la derecha (44-50) y una arriba (2.67-5)
+    y_edges = np.concatenate(([30], y_inner, [50]))
+    z_edges = np.concatenate((z_inner, [5]))
+    
+    # 4. Cálculo del Histograma 2D
+    # H tiene shape (len(y_edges)-1, len(z_edges)-1) -> (cols, rows)
+    H, x_edges, y_edges_hist = np.histogram2d(y_vals, z_vals, bins=[y_edges, z_edges])
+    
+    # Transponemos H para que coincida con (y, x) de Plotly Heatmap (filas=z, cols=y)
+    z_grid = H.T 
+    
+    # Etiquetas de texto (número de tiros)
+    text_grid = z_grid.astype(int).astype(str)
+    text_grid[text_grid == '0'] = '' # Ocultar ceros para limpieza
+
+    fig = go.Figure()
+
+    # --- HEATMAP (GRID) ---
+    fig.add_trace(go.Heatmap(
+        z=z_grid,
+        x=y_edges, # Bordes en X (Y del campo)
+        y=z_edges, # Bordes en Y (Z del campo)
+        colorscale='Hot',
+        reversescale=True,
+        text=text_grid,
+        texttemplate="%{text}",
+        textfont=dict(size=14, family="Arial Black"),
+        showscale=True,
+        opacity=0.7,
+        xgap=1, ygap=1, # Separación entre bloques
+        hoverinfo='z'
+    ))
+
+    # --- DIBUJO DE LA PORTERÍA REALISTA ---
+    goal_y_min, goal_y_max = 36, 44
+    goal_z_max = 2.67
+    
+    # Red
+    for i in np.linspace(goal_y_min, goal_y_max, 30):
+        fig.add_shape(type="line", x0=i, y0=0, x1=i, y1=goal_z_max, line=dict(color="rgba(255,255,255,0.1)", width=1))
+    for i in np.linspace(0, goal_z_max, 15):
+        fig.add_shape(type="line", x0=goal_y_min, y0=i, x1=goal_y_max, y1=i, line=dict(color="rgba(255,255,255,0.1)", width=1))
+        
+    # Postes
+    fig.add_shape(type="rect", x0=goal_y_min-0.15, y0=0, x1=goal_y_min, y1=goal_z_max+0.15, line=dict(width=0), fillcolor="#F0F0F0")
+    fig.add_shape(type="rect", x0=goal_y_max, y0=0, x1=goal_y_max+0.15, y1=goal_z_max+0.15, line=dict(width=0), fillcolor="#F0F0F0")
+    fig.add_shape(type="rect", x0=goal_y_min-0.15, y0=goal_z_max, x1=goal_y_max+0.15, y1=goal_z_max+0.15, line=dict(width=0), fillcolor="#F0F0F0")
+
+    # --- DECORACIÓN Y LOGOS ---
+    # Logo La Liga (Esquina Superior Derecha)
+    fig.add_layout_image(dict(
+        source="https://upload.wikimedia.org/wikipedia/commons/thumb/0/0f/LaLiga_logo_2023.svg/800px-LaLiga_logo_2023.svg.png",
+        xref="paper", yref="paper", x=0.95, y=1.15, sizex=0.15, sizey=0.15, xanchor="right", yanchor="top"
+    ))
+    
+    # Título Dinámico
+    title_main = "<b>Mapa de Calor (Zonas)</b>"
+    subtitle = f"Total: {int(H.sum())} tiros"
+    
+    # Logo del Equipo (si se filtra por equipo)
+    if team_name:
+        title_main = f"<b>{team_name}</b> - Heatmap"
+        if df_logos is not None:
+             l_t = df_logos[df_logos['team_name'] == team_name]['team_logo'].values
+             if len(l_t) > 0:
+                 # Logo al lado del título (Izquierda)
+                 fig.add_layout_image(dict(source=l_t[0], xref="paper", yref="paper", x=0.05, y=1.15, sizex=0.12, sizey=0.12, xanchor="left", yanchor="top"))
+    
+    # Si es un partido específico
+    elif match_ids is not None and len(match_ids) == 1 and df_matches is not None:
+        match_info = df_matches[df_matches['match_id'] == match_ids[0]]
+        if not match_info.empty:
+            h = match_info.iloc[0]['home_team_name']
+            a = match_info.iloc[0]['away_team_name']
+            subtitle += f" | {h} vs {a}"
+
+    fig.update_layout(
+        title=dict(text=f"{title_main}<br><span style='font-size:14px; color:#ccc;'>{subtitle}</span>", y=0.95, x=0.5, xanchor='center', font=dict(color="white", size=20)),
+        plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
+        xaxis=dict(range=[32, 48], showgrid=False, visible=False, fixedrange=False), # Zoom habilitado
+        yaxis=dict(range=[-0.5, 4], showgrid=False, visible=False, scaleanchor="x", scaleratio=1, fixedrange=False),
+        margin=dict(t=100, b=40, l=40, r=40),
+        width=800, height=550,
+        dragmode='zoom'
+    )
+    
+    return fig
+```
+
+```{python}
+# Ejemplo: Heatmap
+fig_heatmap = plot_goal_mouth_heatmap(shots_360_limpio, df_matches = None, df_logos = None, team_name='Real Madrid', only_goals=False, n_cols_inside=3, n_rows_inside=3)
+fig_heatmap.show()
+```
+
+Observamos que, de los 636 tiros totales que realizó el Real Madrid, sólamente 252 llegaron a línea de fondo (es decir, no fueron bloqueados o desviados antes de llegar a portería), destacando que la mayor zona de finalización durante la temporada fue la baja izquierda, contando con 46 tiros en dicha zona. 
+
+### HeatMap del campo en función del número de tiros
+
+```{python}
+def custom_pitch(color="#d0d0d0", line_color='black', half=False):
+    """Crea un objeto Pitch personalizado para StatsBomb.
+
+    - color: color de fondo del terreno
+    - line_color: color de las líneas
+    - half: si True solicita a mplsoccer que dibuje solo media cancha (parámetro `half` de Pitch si está disponible)
+    """
+    # Pasamos `half` a Pitch; algunas versiones de mplsoccer soportan este argumento
+    try:
+        pitch = Pitch(pitch_type='statsbomb', pitch_color=color, line_color=line_color, half=half)
+    except TypeError:
+        # fallback si la versión de mplsoccer no soporta `half`
+        pitch = Pitch(pitch_type='statsbomb', pitch_color=color, line_color=line_color)
+    return pitch
+
+def make_regular_pitch_zones():
+    """Crea las zonas del campo con una cuadrícula de 20x20 celdas.
+
+    Devuelve:
+    - x_lines: lista de cortes en X (21 líneas para 20 celdas)
+    - y_lines: lista de cortes en Y (21 líneas para 20 celdas)
+    - cells: lista de celdas con límites (x0,x1,y0,y1) y centro (cx,cy)
+    """
+    pitch_length = 120.0
+    pitch_height = 80.0
+    
+    num_divisions = 15
+
+    # Cortes para crear 20 divisiones en cada eje
+    x_step = pitch_length / num_divisions  # 6 unidades
+    y_step = pitch_height / num_divisions  # 4 unidades
+    
+    x_lines = [i * x_step for i in range(num_divisions + 1)]  # 21 líneas -> 20 celdas
+    y_lines = [i * y_step for i in range(num_divisions + 1)]  # 21 líneas -> 20 celdas
+
+    # Construir celdas como pares x e y contiguos (20x20 = 400 celdas)
+    cells = []
+    for i in range(len(x_lines) - 1):
+        for j in range(len(y_lines) - 1):
+            x0, x1 = x_lines[i], x_lines[i + 1]
+            y0, y1 = y_lines[j], y_lines[j + 1]
+            cells.append({
+                'id': f'{i}_{j}',
+                'i': i,
+                'j': j,
+                'x0': x0,
+                'x1': x1,
+                'y0': y0,
+                'y1': y1,
+                'cx': (x0 + x1) / 2.0,
+                'cy': (y0 + y1) / 2.0,
+            })
+
+    return x_lines, y_lines, cells
+
+def make_pitch_zones():
+    """Crea las zonas del campo divididas por medio campo y área.
+
+    Definición:
+    - Eje X (longitud 120): [0, 60, 102, 120]
+      - Campo propio: 0-60
+      - Fuera del área: 60-102
+      - Dentro del área: 102-120
+    - Eje Y (altura 80): líneas en [0, 18, 30, 50, 62, 80]
+      - Bandas exteriores y zonas del área
+
+    Devuelve:
+    - x_lines: lista de cortes en X
+    - y_lines: lista de cortes en Y
+    - cells: lista de celdas con límites (x0,x1,y0,y1) y centro (cx,cy)
+    """
+    pitch_length = 120.0
+    pitch_height = 80.0
+
+    # Cortes: medio campo (60) y borde del área (102)
+    x_lines = [0, 60, 102, 120]
+    y_lines = [0, 18, 30, 50, 62, 80]
+
+    # Construir celdas como pares x e y contiguos
+    cells = []
+    for i in range(len(x_lines) - 1):
+        for j in range(len(y_lines) - 1):
+            x0, x1 = x_lines[i], x_lines[i + 1]
+            y0, y1 = y_lines[j], y_lines[j + 1]
+            cells.append({
+                'id': f'{i}_{j}',
+                'i': i,
+                'j': j,
+                'x0': x0,
+                'x1': x1,
+                'y0': y0,
+                'y1': y1,
+                'cx': (x0 + x1) / 2.0,
+                'cy': (y0 + y1) / 2.0,
+            })
+
+    return x_lines, y_lines, cells 
+    
+def draw_heatmap_shot(shots_df):
+
+    pitch = custom_pitch(line_color='white')
+    fig, ax = pitch.draw(figsize=(10, 7))
+
+    # Obtener zonas según la definición actual
+    x_lines, y_lines, cells = make_regular_pitch_zones()
+    pitch_length = 120.0
+    pitch_height = 80.0
+
+    # Dibujar líneas de rejilla sobre el pitch
+    for x in x_lines:
+        ax.plot([x, x], [0, pitch_height], color='white', linewidth=1, linestyle='--', alpha=0.3, zorder=3)
+    for y in y_lines:
+        ax.plot([0, pitch_length], [y, y], color='white', linewidth=1, linestyle='--', alpha=0.3, zorder=3)
+
+    # Contar tiros por celda (x e y)
+    counts = []
+    for cell in cells:
+        x0, x1, y0, y1 = cell['x0'], cell['x1'], cell['y0'], cell['y1']
+        mask = (
+            (shots_df['x'] >= x0) & (shots_df['x'] < x1) &
+            (shots_df['y'] >= y0) & (shots_df['y'] < y1)
+        )
+        count = int(mask.sum())
+        counts.append(count)
+        cell['count'] = count
+
+    max_count = max(counts) if counts else 1
+
+    # Escala de color sencilla (rojo con intensidad)
+  
+    cmap = cm.get_cmap('Reds')
+
+    for cell in cells:
+        x0, x1, y0, y1 = cell['x0'], cell['x1'], cell['y0'], cell['y1']
+        cx, cy = cell['cx'], cell['cy']
+        count = cell.get('count', 0)
+        norm = (count / max_count) if max_count > 0 else 0.0
+        norm = 0.15 + 0.85 * norm  # evitar tonos demasiado claros
+        face = cmap(norm)
+        rect = patches.Rectangle((x0, y0), x1 - x0, y1 - y0,
+                                 linewidth=1, edgecolor='white', facecolor=face, alpha=0.5, zorder=2)
+        ax.add_patch(rect)
+        ax.text(cx, cy, str(count), color='white', fontsize=12, ha='center', va='center', zorder=3)
+
+    fig
+```
+
+```{python}
+#| column: page
+#| fig-align: center
+#| warning: false
+draw_heatmap_shot(shots_360_limpio)
+```
+
+En la gráfica, se muestra el campo dividido en una cuadrícula de 20x20 celdas, donde cada celda está coloreada según el número de tiros realizados desde esa zona. Se observa como, a medida que los lanzamientos son mas cercanos a la portería, el número de tiros aumenta, destacando las zonas más peligrosas en las zonas centrales.
+
+Para un análisis más en profundidad, a continuación se muestra un heatmap que incluye métricas adicionales como el xG acumulado y el porcentaje de tiros desde cada zona.
+
+### HeatMap de los tiros por zona del campo
+
+```{python}
+
+
+def draw_heatmap_shot_per_zone(shots_df):
+    """Dibuja un pitch con zonas de tiro coloreadas según número de tiros.
+    
+    Usa make_pitch_zones con zonas:
+    - X: Campo propio (0-60), Fuera del área (60-102), Dentro del área (102-120)
+    - Y: Bandas [0, 18, 30, 50, 62, 80]
+    
+    Muestra en cada celda: tiros, xG acumulado, % del total.
+    """
+
+    pitch = custom_pitch(line_color='white')
+    fig, ax = pitch.draw(figsize=(10, 7))
+
+    # Obtener zonas según make_pitch_zones
+    x_lines, y_lines, cells = make_pitch_zones()
+    pitch_length = 120.0
+    pitch_height = 80.0
+
+    # Dibujar líneas de rejilla sobre el pitch
+    for x in x_lines:
+        ax.plot([x, x], [0, pitch_height], color='white', linewidth=1, linestyle='--', alpha=0.3, zorder=3)
+    for y in y_lines:
+        ax.plot([0, pitch_length], [y, y], color='white', linewidth=1, linestyle='--', alpha=0.3, zorder=3)
+
+    # Detectar columna xG
+    cols = shots_df.columns.tolist()
+    xg_col = 'shot_statsbomb_xg' if 'shot_statsbomb_xg' in cols else 'statsbomb_xg' if 'statsbomb_xg' in cols else None
+    
+    total_shots = len(shots_df)
+
+    # Contar tiros y calcular métricas por celda
+    counts = []
+    for cell in cells:
+        x0, x1, y0, y1 = cell['x0'], cell['x1'], cell['y0'], cell['y1']
+        mask = (
+            (shots_df['x'] >= x0) & (shots_df['x'] < x1) &
+            (shots_df['y'] >= y0) & (shots_df['y'] < y1)
+        )
+        cell_shots = shots_df[mask]
+        count = len(cell_shots)
+        counts.append(count)
+        cell['count'] = count
+        cell['xg_sum'] = cell_shots[xg_col].sum() if xg_col and xg_col in cell_shots.columns else 0
+        cell['xg_mean'] = cell_shots[xg_col].mean() if xg_col and xg_col in cell_shots.columns and count > 0 else 0
+        cell['pct'] = (count / total_shots * 100) if total_shots > 0 else 0
+
+    max_count = max(counts) if counts else 1
+
+    # Escala de color sencilla (rojo con intensidad)
+    cmap = cm.get_cmap('Reds')
+
+    for cell in cells:
+        x0, x1, y0, y1 = cell['x0'], cell['x1'], cell['y0'], cell['y1']
+        cx, cy = cell['cx'], cell['cy']
+        count = cell.get('count', 0)
+        xg_mean = cell.get('xg_mean', 0)
+        pct = cell.get('pct', 0)
+        
+        norm = (count / max_count) if max_count > 0 else 0.0
+        norm = 0.15 + 0.85 * norm  # evitar tonos demasiado claros
+        face = cmap(norm)
+        rect = patches.Rectangle((x0, y0), x1 - x0, y1 - y0,
+                                 linewidth=1, edgecolor='white', facecolor=face, alpha=0.5, zorder=2)
+        ax.add_patch(rect)
+        
+        # Texto con tiros, xG medio y porcentaje
+        text_lines = f"{count}\nxG: {xg_mean:.2f}\n{pct:.3f}%"
+        ax.text(cx, cy, text_lines, color='white', fontsize=9, ha='center', va='center', zorder=3,
+                fontweight='bold')
+
+    fig
+```
+
+
+```{python}
+#| warning: false
+#| column: page
+#| fig-align: center
+
+draw_heatmap_shot_per_zone(shots_360_limpio)
+```
+
+De esta otra forma, en esta grafica, se puede ver por zonas del campo no solo el número de tiros realizados, sino también el xG medio de los tiros desde esa zona y el porcentaje que representan esos tiros respecto al total. Esto permite identificar no solo las zonas más activas, sino también aquellas que generan tiros de mayor calidad.
+
+Se observa como en las zonas cercanas al área, especialmente en el carril central, se concentran la mayoría de los tiros y con un xG medio más alto, indicando que son las zonas más peligrosas para el equipo contrario.
+
+### Mapa de tiros según sus características.
+```{python}	
+
+def draw_shot_campogram(shots_df, color_by='sub_type_name', top_n=4, figsize=(8, 5), title=None):
+    """Dibuja un campograma compacto coloreado por categorías.
+
+    - shots_df: DataFrame con columnas mínimas `x`, `y`. Opcional `end_x`, `end_y`.
+    - color_by: columna categórica para colorear (e.g., 'outcome_name').
+    - top_n: número de categorías top a mostrar (por frecuencia). Las categorías fuera del top se agrupan en 'Other'.
+    - devuelve: matplotlib.figure
+    """
+    if shots_df is None or shots_df.empty:
+        # devolver una figura vacía informativa
+        fig, ax = plt.subplots(figsize=figsize)
+        ax.text(0.5, 0.5, 'No data', ha='center', va='center')
+        ax.axis('off')
+        return fig
+
+    df = shots_df.copy()
+    if color_by not in df.columns:
+        df[color_by] = 'Unknown'
+
+    # calcular top N categorías
+    counts = df[color_by].value_counts()
+    top = list(counts.head(top_n).index)
+    df['__cat_plot__'] = df[color_by].where(df[color_by].isin(top), other='Other')
+
+    cats = df['__cat_plot__'].unique().tolist()
+    # ordenar cats by counts descending
+    cats = sorted(cats, key=lambda c: (-int((df['__cat_plot__'] == c).sum()), c))
+
+    # colores
+    cmap = cm.get_cmap('tab10')
+    colors = {cat: cmap(i % 10) for i, cat in enumerate(cats)}
+
+    pitch = custom_pitch(line_color='white', half=True)
+    fig, ax = pitch.draw(figsize=figsize)
+
+    # por cada categoría dibujar flechas/markers
+    for cat in cats:
+        sub = df[df['__cat_plot__'] == cat]
+        if sub.empty:
+            continue
+        sx = sub['x'].values
+        sy = sub['y'].values
+        ex = sub['end_x'].values if 'end_x' in sub.columns else None
+        ey = sub['end_y'].values if 'end_y' in sub.columns else None
+
+        # aquellos con end coordinates
+        has_end = False
+        if ex is not None and ey is not None:
+            mask_end = ~pd.isna(ex) & ~pd.isna(ey)
+            if mask_end.any():
+                has_end = True
+                pitch.arrows(sx[mask_end], sy[mask_end], ex[mask_end], ey[mask_end],
+                             ax=ax, color=colors[cat], width=1.2, headwidth=2, alpha=0.9, zorder=5)
+
+        # dibujar puntos para tiros sin end
+        if ex is not None and ey is not None:
+            mask_noend = pd.isna(ex) | pd.isna(ey)
+            if mask_noend.any():
+                pitch.scatter(sx[mask_noend], sy[mask_noend], ax=ax, color=colors[cat], s=30, alpha=0.9, zorder=6)
+        else:
+            # si no hay end cols, dibujar todos como puntos
+            pitch.scatter(sx, sy, ax=ax, color=colors[cat], s=30, alpha=0.9, zorder=6)
+
+    # leyenda con conteos
+    handles = []
+    for cat in cats:
+        cnt = int((df['__cat_plot__'] == cat).sum())
+        lab = f"{cat} ({cnt})"
+        handles.append(patches.Patch(color=colors[cat], label=lab))
+
+    if handles:
+        ax.legend(handles=handles, fontsize=5, loc='upper left', framealpha=0.7, markerscale=0.4)
+
+    return fig
+
+```
+
+En la siguiente gráfica se observa como los tiros predominantes son los tiros realizados con el pie derecho (Right Foot) y con el pie izquierdo (Left Foot).
+
+```{python}
+#| warning: false
+fig_campogram_body_part_name = draw_shot_campogram(shots_360_limpio, color_by='body_part_name', top_n=4, figsize=(8, 5))
+
+```
+
+Por otro lado, en la siguiente gráfica se observa como los tiros predominantes son los tiros que no van a puerta (Off Target) y los tiros que son parados por el portero (Saved).
+
+```{python}
+#| warning: false
+
+fig_campogram_outcome = draw_shot_campogram(shots_360_limpio, color_by='outcome_name', top_n=10, figsize=(8, 5))
+```
+
+En la última gráfica de características de los tiros, se observa como los tipos de jugadas precedentes a los tiros mas comunes son los tiros de jugada abierta (Open Play) y los tiros de cabeza (Header).
+
+```{python}
+#| warning: false
+fig_campogram_type = draw_shot_campogram(shots_360_limpio, color_by='sub_type_name', top_n=5, figsize=(8, 5))
+```
+
+
+## Análisis de las Métricas de StatsBomb (xG y xGOT)
+
+Una vez se han visualizado los tiros y goles de varias formas, vamos a evaluar el rendimiento utilizando las métricas probabilísticas más comunes en la industria del fútbol. 
+
+### Rendimiento Ofensivo: Goles Reales vs Expected Goals (xG) por Equipo
+
+Esta gráfica nos permite identificar qué equipos están marcando más goles de lo que sus ocasiones sugieren y cuáles están teniendo problemas de finalización. Lo ideal sería: Goles = xG.
+
+```{python}
+#| label: fig-goles-xg-plotly-v3
+#| warning: false
+
+import plotly.express as px
+
+# 1. Preparamos datos: Renombramos la columna xG para la gráfica
+df_plot = resumen_equipos.rename(columns={'xG Total': 'Goles Esperados (xG)'})
+
+# Calculamos el máximo para los ejes
+max_val = max(df_plot['Goles (Shot)'].max(), df_plot['Goles Esperados (xG)'].max()) + 5
+
+# 2. Creamos el gráfico base
+fig = px.scatter(
+    df_plot,
+    x='Goles Esperados (xG)', 
+    y='Goles (Shot)',
+    hover_name='Equipo',      
+    size='Tiros Totales',     
+    
+    # --- AQUÍ ESTABA EL ERROR ---
+    color='Ratio Gol/Tiro',
+    # ----------------------------
+    
+    color_continuous_scale='RdYlGn', 
+    title='<b>Eficacia Ofensiva: Goles Reales vs Esperados</b>',
+    
+    # Opcional: Formatear el ratio para que se vea bonito al pasar el ratón (2 decimales)
+    hover_data={'Ratio Gol/Tiro':':.2f'} 
+)
+
+# 3. Añadimos la línea diagonal (x=y)
+fig.add_shape(
+    type="line",
+    x0=0, y0=0, x1=max_val, y1=max_val,
+    line=dict(color="Red", width=2, dash="dash"),
+)
+
+# 4. Configuración del layout
+fig.update_layout(
+    height=600,
+    width=900,
+    xaxis=dict(range=[0, max_val], title="Goles Esperados (xG)"),
+    yaxis=dict(range=[0, max_val], title="Goles Reales"),
+    template="plotly_white"
+)
+
+fig.show()
+```
+
+### Calidad de Ejecución: Shooting Goals Added (xGOT - xG)
+
+Además de comparar goles, es crucial analizar la **calidad del golpeo**. Utilizamos la métrica derivada xGOT - xG para evaluar qué tan bien un jugador ejecuta sus tiros en comparación con la calidad esperada de esos tiros. 
+
+- Valores Positivos: El equipo mejora la probabilidad de gol mediante buenos disparos
+- Valor Negativo: El equipo empeora la ocasión debido a malos disparos
+
+```{python}
+#| label: fig-shooting-added-v3
+#| fig-cap: "Valor añadido por la ejecución del tiro (xGOT - xG)"
+#| warning: false
+
+# 1. Agrupamos por equipo y sumamos las probabilidades
+xg_xgot = shots_360_limpio.groupby('possession_team_name').agg({
+    'shot_statsbomb_xg': 'sum',         # xG (Probabilidad de la ocasión)
+    'shot_shot_execution_xg': 'sum'     # xGOT (Probabilidad tras el golpeo)
+}).reset_index()
+
+# 2. Calculamos el Uplift acumulado (Diferencia directa)
+# Uplift = Calidad del Tiro - Calidad de la Ocasión
+xg_xgot['shooting_added'] = xg_xgot['shot_shot_execution_xg'] - xg_xgot['shot_statsbomb_xg']
+
+# Ordenamos de mayor valor añadido a menor (el que más mejora sus jugadas arriba)
+xg_xgot = xg_xgot.sort_values('shooting_added', ascending=False)
+
+# 3. Visualización
+plt.figure(figsize=(12, 8))
+
+# Colores: Verde si suman valor (xGOT > xG), Rojo si restan (fallan mucho o tiran flojo)
+colors = ['#2ecc71' if x > 0 else '#e74c3c' for x in xg_xgot['shooting_added']]
+
+sns.barplot(
+    data=xg_xgot, 
+    x='shooting_added', 
+    y='possession_team_name', 
+    palette=colors
+)
+
+plt.title('Shooting Goals Added: Valor Añadido por Ejecución', fontsize=14, fontweight='bold')
+plt.xlabel('Diferencia Acumulada (xGOT - xG)', fontsize=12)
+plt.ylabel('') # Quitamos la etiqueta del eje Y para que quede más limpio
+plt.axvline(0, color='black', linewidth=1) # Línea central de referencia
+plt.grid(axis='x', linestyle='--', alpha=0.5)
+
+plt.show()
+```
+
+Observamos que los equipos que más mejoran las oportunidades con mejores disparos son el Barsa y el Leganés entre otros, aunque en media, todos los equipos tienden a mejorar sus oportunidades menos el Valladolid y el Rayo Vallecano, cuya diferencia acumulada es 2 puntos negativa. 
+
+# Cálculo de nueva información a partir de los datos (métricas básicas)
+
+Comprendidos los datos originales, a partir del Dataframe *shots_360_limpio* se va a extraer información nueva:
+
+## Tiro dentro o fuera del área
+
+Statbombs normaliza las coordenadas de todo el campo de juego entre 0 y 120 en el eje X y entre 0 y 80 en el eje Y. Por tanto, el área se encuentra delimitada por los siguientes puntos:
+
+- Eje X: Desde 102 hasta el 120. (El área mide 18 unidades de largo)
+- Eje Y: Desde 18 hasta 62. (El área mide 44 unidades de ancho)
+
+Sabiendo estos límites, se va a crear una nueva variable, *dentro_area*, que tomará los valores 0 o 1 dependiendo si el tiro se encuentra dentro del área o no: 
+
+```{python}
+shots_360_limpio['dentro_area'] = shots_360_limpio.apply(
+    lambda row: 1 if (row['x'] >= 102 and 18 <= row['y'] <= 62) else 0,
+    axis=1
+)
+```
+
+## Distancia al centro de la portería
+
+La portería se encuentra situada en el eje X en la posición 120 y en el eje Y, entre las coordenadas 36 y 44, luego el centro de la portería estará en (120, 40). Teniendo esta posición de la portería y la posición desde donde se realiza el tiro ('x', 'y'), podemos calcular la distancia euclídea entre ambos puntos:
+
+```{python}
+shots_360_limpio['distancia_centro_porteria'] = shots_360_limpio.apply(
+    lambda row: ((120 - row['x'])**2 + (40 - row['y'])**2)**0.5,
+    axis=1
+)
+```
+
+## Ángulo con los palos de la portería
+
+Como bien hemos dicho en el apartado anterior, la portería se encuentra situada en el eje X en la posición 120 y en el eje Y, entre las coordenadas 36 y 44. Por tanto, los palos de la portería estarán situados en los puntos (120, 36) y (120, 44). Teniendo en cuenta estos puntos y la posición desde donde se realiza el tiro ('x','y'), podemos calcular el ángulo formado entre los dos palos de la portería y el punto desde donde se realiza el tiro. Para ello: 
+
+- Sea A el punto desde donde se realiza el tiro (x, y)
+- Sea P1 el palo izquierdo de la portería (120, 36)
+- Sea P2 el palo derecho de la portería (120, 44)
+
+Vamos a calcular el ángulo que forma A con P1 y P2 utilizando la fórmula del producto escalar:
+
+Para determinar el ángulo de tiro, definimos primero los vectores que unen el balón con cada uno de los postes:
+
+$$
+\begin{aligned}
+\vec{v_1} = \vec{AP_1} &= (120 - x, \; 36 - y) \\
+\vec{v_2} = \vec{AP_2} &= (120 - x, \; 44 - y)
+\end{aligned}
+$$
+
+Utilizando la definición geométrica del producto escalar, sabemos que:
+
+$$
+\vec{v_1} \cdot \vec{v_2} = |\vec{v_1}| \cdot |\vec{v_2}| \cdot \cos(\alpha)
+$$
+
+Donde $\alpha$ es el ángulo formado en el vértice $A$ (la posición del balón). Despejando $\alpha$ y sustituyendo por las coordenadas del sistema StatsBomb, obtenemos la expresión analítica final:
+
+$$
+\alpha = \arccos \left( \frac{(120 - x)^2 + (36 - y)(44 - y)}{\sqrt{(120 - x)^2 + (36 - y)^2} \cdot \sqrt{(120 - x)^2 + (44 - y)^2}} \right)
+$$
+
+Por lo tanto, implementamos esta fórmula en el DataFrame:
+
+```{python}
+shots_360_limpio['angulo_porteria'] = shots_360_limpio.apply(
+    lambda row: np.degrees(np.arccos(
+        np.clip( # <--- Esto te salva de errores
+            (
+                (120 - row['x'])**2 + (36 - row['y'])*(44 - row['y'])
+            ) / (
+                ((120 - row['x'])**2 + (36 - row['y'])**2)**0.5 * ((120 - row['x'])**2 + (44 - row['y'])**2)**0.5
+            ), 
+            -1.0, 1.0 # Límites forzados
+        )
+    )),
+    axis=1
+)
+```
+
+**Nota:** Es importante utilizar `np.clip` para evitar errores numéricos que puedan surgir al calcular el arcocoseno, asegurando que el valor dentro de la función `arccos` siempre esté en el rango [-1, 1]. Además, convertimos el ángulo de radianes a grados para facilitar su interpretación.
+
+## Jugadores dentro del ángulo de la portería
+
+Para calcular el número de jugadores dentro del ángulo de la portería, vamos a seguir los siguientes pasos:
+
+1. Definir el triángulo formado por los dos palos de la portería y el punto desde donde se realiza el tiro.
+2. Para cada jugador visible (compañeros y rivales), comprobar si su posición está dentro de ese triángulo, empleando el método de las **Coordenadas Baricéntricas**. 
+3. Si el jugador cumple la condición, guardar un valor True junto con la posición del jugador en una lista (las variables *posiciones_compañeros* y *posiciones_rivales* ya contienen las posiciones de los jugadores visibles).
+
+### ¿Cómo funciona el método de las Coordenadas Baricéntricas?
+
+Este método matemático se basa en la premisa de que cualquier punto situado en el plano del triángulo de tiro se puede expresar como una combinación lineal ponderada de sus tres vértices, $P = A + w_1 \vec{AB} + w_2 \vec{AC}$.
+
+Sea $A$ la posición del tiro, $B$ y $C$ los postes, y $P(x_p, y_p)$ la posición del jugador a comprobar. Las fórmulas para obtener los pesos baricéntricos $w_1$ y $w_2$ se derivan de la solución del sistema vectorial:
+
+$$
+\begin{aligned}
+\text{Denominador } (\Delta) &= (y_B - y_C)(x_A - x_C) + (x_C - x_B)(y_A - y_C) \\
+\\
+w_1 &= \frac{(y_B - y_C)(x_p - x_C) + (x_C - x_B)(y_p - y_C)}{\Delta} \\
+\\
+w_2 &= \frac{(y_C - y_A)(x_p - x_C) + (x_A - x_C)(y_p - y_C)}{\Delta}
+\end{aligned}
+$$
+
+Una vez calculados los pesos, la condición de **pertenencia estricta** al triángulo es que se cumplan las siguientes tres desigualdades de forma simultánea:
+
+$$
+w_1 \geq 0, \quad w_2 \geq 0, \quad w_1 + w_2 \leq 1
+$$
+
+Además de estas tres condiciones, también hay que comprobar que la posición X del jugador, es mayor (es decir, está a la derecha) del punto desde donde se realiza el tiro, ya que si no, el jugador estaría detrás del balón.
+
+### Implementación en el DataFrame
+
+La función para comprobar si un jugador está o no dentro del ángulo de la portería es la siguiente:
+```{python}
+# Definición de los postes
+POSTE_1 = (120, 36)
+POSTE_2 = (120, 44) 
+
+def punto_en_triangulo(x_player, y_player, x_ball, y_ball):
+    """
+    Verifica si un punto (jugador) está dentro del triángulo formado por 
+    el balón y los postes, usando Coordenadas Baricéntricas.
+    """
+    
+    # --- 1. Causalidad: El jugador debe estar delante del balón ---
+    if x_player <= x_ball:
+        return False
+        
+    # Variables de coordenadas para simplificar (A=Ball, B=P1, C=P2, P=Player)
+    xA, yA = x_ball, y_ball
+    xB, yB = POSTE_1
+    xC, yC = POSTE_2
+    xP, yP = x_player, y_player
+
+    # --- 2. Cálculo de Coordenadas Baricéntricas (w1 y w2) ---
+    
+    # Denominador (Delta)
+    Delta = (yB - yC) * (xA - xC) + (xC - xB) * (yA - yC)
+    
+    if Delta == 0:
+        return False # Evitar división por cero (tiros desde la línea o el poste)
+    
+    # Peso w1 (relativo al vector AB)
+    w1 = ((yB - yC) * (xP - xC) + (xC - xB) * (yP - yC)) / Delta
+    
+    # Peso w2 (relativo al vector AC)
+    w2 = ((yC - yA) * (xP - xC) + (xA - xC) * (yP - yC)) / Delta 
+
+    # --- 3. Condición de Pertenencia ---
+    # Un punto está dentro si w1 >= 0, w2 >= 0, y w1 + w2 <= 1
+    if w1 >= 0 and w2 >= 0 and (w1 + w2) <= 1:
+        return True
+    
+    return False
+```
+
+Teniendo ya la función definida, vamos a aplicarla a cada jugador visible en el lanzamiento (compañeros y rivales) y contar cuántos de ellos están dentro del ángulo de la portería:
+
+```{python}
+# Función para iterar sobre la lista de jugadores de una celda
+def procesar_jugadores_y_angulo(row, columna_jugadores):
+    x_ball, y_ball = row['x'], row['y']
+    lista_original = row[columna_jugadores]
+    
+    nueva_lista_tripletas = []
+    
+    # Iterar sobre cada jugador en la lista
+    for jugador in lista_original:
+        # Extraer coordenadas del diccionario
+        x_jugador = jugador['x']
+        y_jugador = jugador['y']
+        
+        is_blocking = punto_en_triangulo(
+            x_jugador, y_jugador,
+            x_ball, y_ball 
+            # Los postes están definidos globalmente dentro de punto_en_triangulo
+        )
+        
+        # Guardar la nueva tupla (x, y, True/False)
+        nueva_lista_tripletas.append((x_jugador, y_jugador, is_blocking))
+        
+    return nueva_lista_tripletas
+
+# --- Aplicación a las columnas (Creación de las nuevas listas) ---
+
+# 1. Aplicar a Rivales
+shots_360_limpio['rivales_en_angulo'] = shots_360_limpio.apply(
+    lambda row: procesar_jugadores_y_angulo(row, 'posiciones_rivales'), 
+    axis=1
+)
+
+# 2. Aplicar a Compañeros
+shots_360_limpio['compañeros_en_angulo'] = shots_360_limpio.apply(
+    lambda row: procesar_jugadores_y_angulo(row, 'posiciones_compañeros'), 
+    axis=1
+)
+```
+
+Por lo tanto, podemos contar cuántos compañeros y rivales había dentro del ángulo de la portería:
+
+```{python}
+shots_360_limpio['num_rivales_angulo'] = shots_360_limpio['rivales_en_angulo'].apply(
+    lambda lista: sum(1 for _, _, is_blocking in lista if is_blocking)
+)
+shots_360_limpio['num_companeros_angulo'] = shots_360_limpio['compañeros_en_angulo'].apply(
+    lambda lista: sum(1 for _, _, is_blocking in lista if is_blocking)
+)
+```
+
+## Distancia al jugador más cercano dentro del ángulo de la portería
+En este apartado, vamos a calcular la distancia al jugador más cercano dentro del ángulo de la portería. Para ello, vamos a seguir los siguientes pasos:
+
+1. Iterar sobre la lista de jugadores dentro del ángulo (compañeros y rivales).
+2. Calcular la distancia euclídea entre el punto desde donde se realiza el tiro y la posición de cada jugador dentro del ángulo.
+3. Guardar la distancia mínima encontrada.
+
+```{python}
+def distancia_al_jugador_mas_cercano(row, columna_jugadores):
+    x_ball, y_ball = row['x'], row['y']
+    lista_jugadores = row[columna_jugadores]
+    
+    distancias = []
+    
+    for x_jugador, y_jugador, is_blocking in lista_jugadores:
+        if is_blocking:
+            distancia = ((x_jugador - x_ball)**2 + (y_jugador - y_ball)**2)**0.5
+            distancias.append(distancia)
+    
+    if distancias:
+        return min(distancias)
+    else:
+        return np.nan  # Si no hay jugadores en el ángulo
+
+# Aplicar a Rivales
+shots_360_limpio['distancia_rival_mas_cercano'] = shots_360_limpio.apply(
+    lambda row: distancia_al_jugador_mas_cercano(row, 'rivales_en_angulo'),
+    axis=1
+)
+# Aplicar a Compañeros
+shots_360_limpio['distancia_compañero_mas_cercano'] = shots_360_limpio.apply(
+    lambda row: distancia_al_jugador_mas_cercano(row, 'compañeros_en_angulo'),
+    axis=1
+)
+```
+
+## Mejora del xGot respecto del xG
+
+La mejora del xGOT respecto del xG aparece calculada en la columna *shot_shot_execution_xg_uplift*, dato proporcionado directamente por StatsBomb. Representa la diferencia en la probabilidad de meter gol antes de realizar el tiro y una vez se ha realizado y se dirige a la portería.
+
+# Extracción de nueva información con respecto al portero (métricas básicas con respecto al portero)
+
+## Localización del portero
+
+La localización del portero se encuentra en la columna *posiciones_porteros*, que contiene una lista con las posiciones (x,y) de los porteros visibles en el lanzamiento.
+
+## Distancia del punto de finalización al portero
+
+La distancia del punto de finalización al portero se puede calcular de la siguiente manera:
+
+```{python}
+def distancia_finalizacion_portero(row):
+    x_end, y_end = row['x'], row['y']
+    lista_porteros = row['posiciones_porteros']
+    
+    distancias = []
+    
+    for elemento in lista_porteros:
+        x_portero = elemento['x']
+        y_portero = elemento['y']
+        distancia = ((x_portero - x_end)**2 + (y_portero - y_end)**2)**0.5
+        distancias.append(distancia)
+    
+    if distancias:
+        return min(distancias)
+    else:
+        return np.nan  # Si no hay portero visible
+
+shots_360_limpio['distancia_finalizacion_portero'] = shots_360_limpio.apply(
+    distancia_finalizacion_portero,
+    axis=1
+)
+```
+
+## GOL - xGOT
+
+Se calcula la diferencia entre si el tiro fue gol o no y el xGOT:
+
+```{python}
+shots_360_limpio['gol_menos_xgot'] = shots_360_limpio['is_goal'] - shots_360_limpio['shot_shot_execution_xg']
+```
+
+La interpretación de esta métrica es la siguiente:
+- Si el valor es positivo, significa que el jugador ha superado las expectativas del xGOT (ha marcado un gol cuando no se esperaba).
+- Si el valor es negativo, significa que el jugador no ha cumplido con las expectativas del xGOT (no ha marcado un gol cuando se esperaba que lo hiciera).
+
+# Creación de nuevas métricas avanzadas
+
+Hasta el momento se han creado métricas básicas relacionadas con la posición del tiro, el ángulo de la portería y la distancia al portero. Sin embargo, estas métricas no capturan completamente la complejidad espacial del escenario de tiro. Ya que se dispone de datos posicionales detallados de todos los jugadores en el campo en el momento del disparo, se pueden desarrollar métricas más sofisticadas que reflejen mejor la dificultad real del tiro.
+
+Aprovechando esta riqueza de la información posicional, se han desarrollado tres nuevas métricas que permiten cuantificar la oportunidad de gol desde una perspectiva geométrica. 
+
+## Definición de las Métricas
+
+Para capturar las diferentes dimensiones del juego (defensiva, ofensiva y probabilidad de gol), se han diseñado tres indicadores distintos variando los agentes considerados como "obstáculos":
+
+1.  **% Defensive Block Power (Poder de Bloqueo Defensivo)**
+    * **Objetivo:** Evaluar la capacidad estructural del equipo rival para colapsar espacios y bloquear la portería.
+    * **Obstáculos considerados:** Únicamente los **jugadores rivales de campo**.
+    * **Exclusiones:** Se excluye a los compañeros del tirador y al portero.
+    * **Interpretación:** Un porcentaje alto indica que la defensa ha logrado interponerse eficazmente entre el balón y la portería. Es una métrica de mérito defensivo.
+
+2.  **% Shooter Visibility (Visibilidad del Tirador)**
+    * **Objetivo:** Evaluar la selección de tiro (*shot selection*) del delantero y la limpieza de la línea de visión.
+    * **Obstáculos considerados:** **Jugadores rivales y compañeros de equipo**.
+    * **Exclusiones:** Se excluye al portero.
+    * **Interpretación:** Desde la óptica del tirador, un compañero es un obstáculo tan físico como un rival. Un porcentaje bajo sugiere una mala selección de tiro (disparar a través de un "bosque de piernas") o una situación de caos en el área.
+
+3.  **% Open Goal (Portería Libre Real)**
+    * **Objetivo:** Estimar la probabilidad geométrica neta de que el balón encuentre la red si va entre los tres palos.
+    * **Obstáculos considerados:** **Todos** (rivales, compañeros y portero).
+    * **Consideración especial:** Se modela al portero con un radio de influencia mayor ($r \approx 0.5m$) para simular su capacidad de extensión (brazos/estirada), a diferencia de los jugadores de campo ($r \approx 0.35m$).
+    * **Interpretación:** Representa el porcentaje del ángulo de la portería que está matemáticamente libre de intersecciones. Es el indicador más cercano a una probabilidad de gol física.
+
+## Fundamentación Matemática: Geometría de la Visibilidad
+
+Para calcular estas métricas, modelamos el problema en un plano 2D, asumiendo que los jugadores son **obstrucciones circulares** proyectadas sobre el campo de visión del balón hacia la meta.
+
+### Definición del Sistema de Referencia y Ángulo formado por el Balón y los Postes
+
+Sea $B = (x_b, y_b)$ la posición del balón en el momento del disparo. Para modelar la visión del jugador, se define un **sistema de referencia local** con origen en el propio balón, cuyos ejes $X$ e $Y$ se mantienen paralelos a las líneas de banda y fondo del campo respectivamente.
+
+Se definen los postes de la portería como dos puntos fijos en la línea de fondo, $P_1$ y $P_2$. En un campo estándar de StatBomb ($120 \times 80$), las coordenadas de los postes son $P_1(120, 36)$ y $P_2(120, 44)$.
+
+Para determinar el ángulo de tiro, se construye geométricamente un triángulo rectángulo imaginario entre el balón y cada poste. En este triángulo:
+* El **cateto contiguo** representa la distancia horizontal (profundidad) hacia la línea de gol ($x_{P_i} - x_b$).
+* El **cateto opuesto** representa la distancia vertical (anchura) que separa al balón de la altura del poste ($y_{P_i} - y_b$).
+
+Aplicando trigonometría básica, se sabe que la tangente de un ángulo es la razón entre el cateto opuesto y el contiguo. Por tanto, utilizando la función inversa, la **arcotangente**, podemos recuperar el ángulo exacto que forma la línea de visión hacia el poste respecto a la horizontal (la paralela a la línea de banda).
+
+El ángulo total de la portería visto desde el balón, denotado como $\Omega_{goal}$, queda definido entonces por el intervalo angular $[\theta_{min}, \theta_{max}]$. Matemáticamente, se calcula el ángulo polar de cada poste usando la función `atan2` (arcotangente de dos argumentos) para respetar los signos de los cuadrantes:
+
+$$
+\theta_{i} = \operatorname{atan2}(y_{P_i} - y_b, x_{P_i} - x_b), \quad \text{para } i \in \{1, 2\}
+$$
+
+De modo que el intervalo de interés es:
+$$
+I_{goal} = [\min(\theta_1, \theta_2), \max(\theta_1, \theta_2)]
+$$
+
+La amplitud angular de la portería, es decir, el "hueco" total disponible para el disparo, es $\Delta \theta_{goal} = \theta_{max} - \theta_{min}$.
+
+### Modelado de Obstáculos (Jugadores)
+
+Una vez definido el marco de la portería, se procede a calcular la obstrucción visual generada por los jugadores situados en el campo. A diferencia de los postes, que se tratan como puntos adimensionales, se modela a cada jugador $j$ como un obstáculo circular con un volumen físico, definido por su centro $O_j = (x_j, y_j)$ y un radio efectivo $r_j$.
+
+Para determinar el intervalo angular que bloquea cada jugador, se descompone el problema en tres pasos geométricos:
+
+**1. Distancia Euclídea ($d_j$):**
+Primero, se calcula la distancia lineal desde el balón hasta el centro del jugador. Esta magnitud actuará como la hipotenusa en nuestro cálculo trigonométrico posterior.
+$$
+d_j = \| O_j - B \| = \sqrt{(x_j - x_b)^2 + (y_j - y_b)^2}
+$$
+
+**2. Ángulo Central ($\phi_j$):**
+Se determina la dirección exacta hacia el centro del jugador utilizando el mismo sistema de referencia que con la portería. Este ángulo define el eje de simetría de la sombra que proyecta el jugador.
+$$
+\phi_j = \operatorname{atan2}(y_j - y_b, x_j - x_b)
+$$
+
+**3. Semiancho Angular ($\delta_j$):**
+Para hallar la amplitud del bloqueo, se consideran las dos rectas tangentes que van desde el balón hasta los bordes de la circunferencia del jugador. Estas rectas, junto con el radio y la distancia al centro, forman un triángulo rectángulo donde el radio es el cateto opuesto y la distancia es la hipotenusa.
+
+Por consiguiente, el semiancho angular ($\delta_j$) se calcula mediante la función arcoseno:
+
+$$
+\delta_j = \arcsin\left(\frac{r_j}{d_j}\right)
+$$
+
+*Nota: Esta fórmula es válida siempre que $d_j > r_j$. En el caso excepcional donde $d_j \leq r_j$, el jugador se encuentra ocupando la posición del balón, lo que implica un bloqueo total de la visión ($360^\circ$).*
+
+Finalmente, el intervalo de bloqueo generado por el jugador $j$ se define sumando y restando esta amplitud al ángulo central:
+
+$$
+I_j = [\phi_j - \delta_j, \phi_j + \delta_j]
+$$
+
+### Intersección y Unión de Intervalos (Gestión de Superposiciones)
+
+Un desafío crítico es que las sombras de los jugadores pueden solaparse entre sí o caer fuera del marco de la portería. No se puede simplemente sumar las amplitudes $2\delta_j$, ya que se incurriría en conteos dobles.
+
+Para resolver esto, se aplica la siguiente lógica algorítmica:
+
+1.  **Recorte (Clipping):** Para cada jugador $j$, se calcula la intersección de su intervalo de bloqueo con el intervalo de la portería.
+    $$
+    I_j^{clipped} = I_j \cap I_{goal} = [\max(\phi_j - \delta_j, \theta_{min}), \min(\phi_j + \delta_j, \theta_{max})]
+    $$
+    Si el inicio del intervalo es mayor que el final, el jugador no bloquea la portería y es descartado.
+
+2.  **Fusión (Merge Intervals):** Sea $\mathcal{S}$ el conjunto de intervalos válidos $\{I_1^{clipped}, I_2^{clipped}, \dots, I_k^{clipped}\}$. Se ordenan estos intervalos según su ángulo de inicio. Se recorre la lista ordenada fusionando intervalos solapados.
+    
+    Sean dos intervalos ordenados $[a, b]$ y $[c, d]$ donde $a \leq c$.
+    * Si $c < b$, existe solapamiento. El intervalo fusionado resultante es $[a, \max(b, d)]$.
+    * Si $c \geq b$, son disjuntos.
+
+3.  **Cálculo Final:** Tras el proceso de fusión, se obtiene un conjunto de intervalos disjuntos $M = \{[s_1, e_1], \dots, [s_m, e_m]\}$. La suma total del ángulo bloqueado es:
+
+$$
+\Omega_{blocked} = \sum_{k=1}^{m} (e_k - s_k)
+$$
+
+Finalmente, la métrica de visibilidad dependerá del contexto de los obstáculos considerados. En general, se va a calcular el porcentaje de bloqueo:
+
+$$
+\text{Block \%} = \left( \frac{ \Omega_{blocked}}{\Delta \theta_{goal}} \right) \times 100
+$$
+
+Este procedimiento garantiza que la métrica sea robusta ante cualquier configuración de jugadores, evitando duplicidades geométricas.
+
+## Implementación en el DataFrame
+
+Las 3 nuevas métricas se basan en el método descrito en el apartado anterior, variando únicamente los jugadores involucrados. Es por ello que se va a crear primeramente una función que, dado un conjunto de jugadores (obstáculos), calcule el porcentaje de visibilidad según se ha descrito: 
+
+```{python}
+def calcular_metricas_bloqueo(row, incluir_companeros=False, incluir_portero=False):
+    """
+    Calcula el porcentaje del ángulo de la portería bloqueado por jugadores.
+    
+    Parámetros:
+    - row: Fila del DataFrame con info del tiro y jugadores.
+    - incluir_companeros: Si True, incluye compañeros de equipo como obstáculos.
+    - incluir_portero: Si True, incluye al portero (con radio mayor).
+    """
+    # 1. Definir Ángulo de la Portería
+    x_ball, y_ball = row['x'], row['y']
+    # Postes: (120, 36) y (120, 44)
+    p1 = np.array([120, 36])
+    p2 = np.array([120, 44])
+    
+    # Ángulos hacia los postes
+    theta1 = np.arctan2(p1[1] - y_ball, p1[0] - x_ball)
+    theta2 = np.arctan2(p2[1] - y_ball, p2[0] - x_ball)
+    
+    min_theta_goal = min(theta1, theta2)
+    max_theta_goal = max(theta1, theta2)
+    goal_amplitude = max_theta_goal - min_theta_goal
+    
+    if goal_amplitude <= 0:
+        return 0.0 # Sin ángulo de tiro
+
+    # 2. Identificar Portero(s)
+    # row['posiciones_porteros'] es una lista de dicts [{'x':..., 'y':...}]
+    pos_porteros = row.get('posiciones_porteros', [])
+    if not isinstance(pos_porteros, list): pos_porteros = []
+    
+    def es_portero(px, py):
+        for gk in pos_porteros:
+            gkx, gky = gk.get('x'), gk.get('y')
+            if gkx is not None and gky is not None:
+                # Tolerancia de 1 metro para identificar al portero
+                if np.sqrt((px - gkx)**2 + (py - gky)**2) == 0.0:
+                    return True
+        return False
+
+    # 3. Recopilar Obstáculos
+    obstaculos = []
+    
+    # Rivales
+    rivales = row.get('rivales_en_angulo', [])
+    if isinstance(rivales, list):
+        for r in rivales:
+            # r es (x, y, is_blocking)
+            rx, ry, is_blocking = r
+            
+            # Usamos la variable is_blocking como pre-filtro
+            if is_blocking:
+                if es_portero(rx, ry):
+                    if incluir_portero:
+                        obstaculos.append({'x': rx, 'y': ry, 'r': 0.5}) # Radio Portero (0.5m)
+                else:
+                    # Es jugador de campo rival
+                    obstaculos.append({'x': rx, 'y': ry, 'r': 0.35}) # Radio Jugador (0.35m)
+
+    # Compañeros
+    if incluir_companeros:
+        companeros = row.get('compañeros_en_angulo', [])
+        if isinstance(companeros, list):
+            for c in companeros:
+                cx, cy, is_blocking = c
+                if is_blocking:
+                    obstaculos.append({'x': cx, 'y': cy, 'r': 0.35})
+
+    # 4. Calcular Intervalos de Bloqueo
+    intervalos = []
+    for obs in obstaculos:
+        ox, oy, radio = obs['x'], obs['y'], obs['r']
+        dist = np.sqrt((ox - x_ball)**2 + (oy - y_ball)**2)
+        
+        if dist <= radio:
+            return 100.0 # Bloqueo total (balón muy cerca del jugador)
+            
+        # Ángulo central y semiancho
+        phi = np.arctan2(oy - y_ball, ox - x_ball)
+        # Clamp para evitar errores numéricos si radio > dist (aunque cubierto arriba)
+        val = min(1.0, radio / dist)
+        delta = np.arcsin(val)
+        
+        start = phi - delta
+        end = phi + delta
+        
+        # Clipping con la portería
+        start_c = max(start, min_theta_goal)
+        end_c = min(end, max_theta_goal)
+        
+        if start_c < end_c:
+            intervalos.append((start_c, end_c))
+            
+    # 5. Fusionar Intervalos (Merge Intervals)
+    if not intervalos:
+        return 0.0
+        
+    intervalos.sort(key=lambda x: x[0])
+    merged = []
+    curr_start, curr_end = intervalos[0]
+    
+    for next_start, next_end in intervalos[1:]:
+        if next_start < curr_end:
+            curr_end = max(curr_end, next_end)
+        else:
+            merged.append((curr_start, curr_end))
+            curr_start, curr_end = next_start, next_end
+    merged.append((curr_start, curr_end))
+    
+    # 6. Calcular Porcentaje Bloqueado
+    angulo_bloqueado = sum(end - start for start, end in merged)
+    pct_bloqueado = (angulo_bloqueado / goal_amplitude) * 100
+    
+    return pct_bloqueado
+
+# --- APLICACIÓN DE LAS MÉTRICAS ---
+
+# 1. Defensive Block Power (Solo rivales, sin portero) -> % Bloqueado
+shots_360_limpio['defensive_block_power'] = shots_360_limpio.apply(
+    lambda row: calcular_metricas_bloqueo(row, incluir_companeros=False, incluir_portero=False), axis=1
+)
+
+# 2. Shooter Visibility (Rivales + Compañeros, sin portero) -> % Visible (100 - Bloqueado)
+shots_360_limpio['shooter_visibility'] = shots_360_limpio.apply(
+    lambda row: 100 - calcular_metricas_bloqueo(row, incluir_companeros=True, incluir_portero=False), axis=1
+)
+
+# 3. Open Goal (Todos, con portero) -> % Visible (100 - Bloqueado)
+shots_360_limpio['open_goal'] = shots_360_limpio.apply(
+    lambda row: 100 - calcular_metricas_bloqueo(row, incluir_companeros=True, incluir_portero=True), axis=1
+)
+
+# Mostrar un ejemplo de los resultados
+shots_360_limpio[['player_name', 'defensive_block_power', 'shooter_visibility', 'open_goal']].head()
+```
+
+Con el objetivo de interpretar mejor cada métrica, cabe destacar que: 
+
+- **Defensive Block Power**: A mayor porcentaje bloqueado, menos espacio libre ha dejado la defensa rival.
+- **Shooter Visibility**: A mayor porcentaje de esta variable, mayor claridad de tiro para el jugador.
+- **Open Goal**: A mayor porcentaje de esta variable, mayor probabilidad geométrica de gol.
+
+**Nota:** Algunos tiros tienen defensive block power = 100% pero el tiro va a puerta o cerca de ella, esto se debe a que algunos tiros como los de cabeza, no queda contemplado por el algoritmo, se está suponiendo que los tiros son en 2 dimensiones siempre. 
+
+```{python}
+# Guardado parcial del dataframe shots_360_limpio con las nuevas métricas. Para la app
+
+shots_360_limpio.to_parquet('shots_360_limpio_con_metricas.parquet')
+```
+
+# Análisis sobre las métricas básicas
+
+En esta sección, se realizará un análisis sobre las métricas calculadas con anterioridad en el apartado 5. Para ello, se van a calcular dos tablas distintas que contienen a cada equipo y la media de las siguientes métricas básicas: 
+
+- Distancia al centro de la portería (distancia_centro_porteria)
+- Ángulo de la portería (angulo_porteria)
+- Distancia al rival más cercano dentro del ángulo de la portería (distancia_rival_mas_cercano)
+- Distancia finalización al portero (distancia_finalizacion_portero)
+- Gol - xGOT (gol_menos_xgot)
+
+## Análisis sobre las métricas por equipo atacando
+
+```{python}
+# Agrupación por equipo y cálculo de medias
+metricas_equipos_atacando = shots_360_limpio.groupby('possession_team_name').agg({
+    'distancia_centro_porteria': 'mean',
+    'angulo_porteria': 'mean',
+    'distancia_rival_mas_cercano': 'mean',
+    'distancia_finalizacion_portero': 'mean',
+    'gol_menos_xgot': 'mean'
+}).reset_index()
+metricas_equipos_atacando.rename(columns={
+    'possession_team_name': 'Equipo',
+    'distancia_centro_porteria': 'Distancia al Centro de la Portería',
+    'angulo_porteria': 'Ángulo de tiro respecto a la Portería',
+    'distancia_rival_mas_cercano': 'Distancia al Rival Más Cercano en Ángulo',
+    'distancia_finalizacion_portero': 'Distancia Finalización al Portero (m)',
+    'gol_menos_xgot': 'Gol - xGOT'
+}, inplace=True)
+
+metricas_equipos_atacando
+```
+
+Una vez calculada la tabla anterior, se va a realizar un PCA con el objetivo de reducir la dimensionalidad de los datos y poder visualizar qué equipos tienen perfiles similares en cuanto a las métricas calculadas.
+
+```{python}
+#| column: page
+#| fig-align: center
+
+
+# --- 1. PREPARACIÓN DE DATOS ---
+nombres_equipos = metricas_equipos_atacando.iloc[:, 0].values
+datos_numericos = metricas_equipos_atacando.iloc[:, 1:]
+nombres_variables = datos_numericos.columns
+
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(datos_numericos)
+
+# --- 2. APLICACIÓN DEL PCA ---
+pca = PCA(n_components=2)
+X_pca = pca.fit_transform(X_scaled)
+
+# --- 3. INTERPRETACIÓN NUMÉRICA ---
+
+# A) Varianza Explicada
+var_explicada = pca.explained_variance_ratio_
+print(f"--- RESUMEN DE VARIANZA ---")
+print(f"Componente 1 (PC1): {var_explicada[0]:.2%} de la información.")
+print(f"Componente 2 (PC2): {var_explicada[1]:.2%} de la información.")
+print(f"Total acumulado: {sum(var_explicada):.2%}\n")
+
+# B) Cargas (Loadings):
+cargas = pd.DataFrame(
+    pca.components_.T, 
+    columns=['PC1', 'PC2'], 
+    index=nombres_variables
+)
+
+print("--- PESO DE LAS VARIABLES (CARGAS) ---")
+print(cargas.sort_values(by='PC1', ascending=False))
+print("-" * 30)
+
+# --- 4. VISUALIZACIÓN PROFESIONAL (BIPLOT) ---
+plt.figure(figsize=(12, 10))
+sns.set_style("whitegrid") # Estilo limpio
+
+# A) Scatter Plot de los Equipos
+plt.scatter(X_pca[:, 0], X_pca[:, 1], c=X_pca[:, 0], cmap='viridis', s=100, alpha=0.7, edgecolors='k')
+
+# B) Etiquetas de los Equipos
+for i, nombre in enumerate(nombres_equipos):
+    plt.text(X_pca[i, 0] + 0.1, X_pca[i, 1] + 0.1, nombre, fontsize=9)
+
+# C) Proyección de las Variables Originales (Las Flechas)
+factor_escala = max(X_pca[:, 0]) * 0.8 
+
+for i, variable in enumerate(nombres_variables):
+    # Coordenadas de la flecha
+    x_arrow = pca.components_[0, i] * factor_escala
+    y_arrow = pca.components_[1, i] * factor_escala
+    
+    # Dibujamos la flecha
+    plt.arrow(0, 0, x_arrow, y_arrow, color='r', alpha=0.5, head_width=0.1)
+    
+    # Ponemos el nombre de la variable en la punta de la flecha
+    plt.text(x_arrow * 1.15, y_arrow * 1.15, variable, color='r', ha='center', va='center', fontsize=10, fontweight='bold')
+
+# D) Decoración Final
+plt.xlabel(f'Componente Principal 1 ({var_explicada[0]:.1%} var)', fontsize=12)
+plt.ylabel(f'Componente Principal 2 ({var_explicada[1]:.1%} var)', fontsize=12)
+plt.title('Mapa de Identidad Ofensiva (PCA Biplot)', fontsize=16, fontweight='bold')
+plt.axhline(0, color='grey', linestyle='--', linewidth=0.8)
+plt.axvline(0, color='grey', linestyle='--', linewidth=0.8)
+
+plt.tight_layout()
+plt.show()
+```
+
+A continuación se van a analizar los PCAs obtenidos: 
+
+- PCA1: Es una especie de media entre las variables de distancia al centro, al portero, al rival y al ángulo de tiro (está en negativo). Por lo tanto, se encontrarán más a la derecha los equipos que tiran desde lejos, cuyo portero está lejos, cuyo rival está lejos y cuyo ángulo de tiro, por estar lejos, es pequeño. Por lo tanto, se encuentra una clara diferencia entre Francotirador vs Finalizador cercano. Equipos más a la izquierda, son equipos que tiran desde cerca, con el portero cerca, con el rival cerca y con un ángulo grande.
+
+- PCA2: Se observa que la única variable que pondera es el Gol - xGOT. Esto indica que los equipos con mayores valores (más arriba) son los equipos que meten goles que teóricamente deberían haber sido parados por los porteros. Esto puede hablar de la calidad de los delanteros o de la debilidad de los porteros rivales. Valores negativos en esta componente indican que el equipo tiene una alta calidad en el tiro pero estos acaban siendo interceptados por el portero. 
+Si se centran en 0 significa, bien los equipos están tirando tiros muy poco probables de meter y efectivamente, no los meten, bien están tirando tiros muy buenos y los meten. 
+Por lo tanto, equipos centrados en el eje horizontal, son equipos que tienen un equilibrio entre tiros buenos y malos, equipos más lejanos del eje horizontal, son equipos que tienen un perfil más definido (o buenos o malos tiros).
+
+Viendo el gráfico se pueden observar equipos: 
+
+- **Real Sociedad**: Ineficiencia frustrante. Es un equipo con un estilo de juego equilibrado, no tiran desde lejos ni desde cerca, pero tienen una ineficiencia notable en la finalización. En PCA2 toma valores negativos, lo que indica que generan tiros con mucha probabilidad de gol pero son incapaces de meterlos, ya que el portero los para.
+
+- **Espanyol**: Es un equipo altamente eficaz. Sin realizar tiros especialmente buenos (xGOT bajo) mete muchos goles. 
+
+- **Osasuna**: Es un equipo que tiene la eficacia que se espera. Al estar cercano a 0 en PCA2 significa que ha metido goles cuyo tiro era altamente probable que entrara a la portería. De igual forma, los goles que no ha marcado eran tiros cuya con poca probabilidad de entrar. Su posición a la izquierda de la gráfica indica valores bajos en PCA1, o lo que es lo mismo, tiros cercanos a la portería.
+
+- **Rayo Vallecano**: Sus valores en PCA2 indican lo mismo que para el Osasuna (son lo eficaces que se espera que sean) con la diferencia de que al posicionarse en PCA1 quedan a la derecha de la gráfica, lo que significa que es un equipo que suele lanzar desde lejos.
+
+## Análisis sobre las métricas por equipo defendiendo
+
+```{python}
+# Agrupación por equipo y cálculo de medias
+metricas_equipos_defendiendo = shots_360_limpio.groupby('defending_team_name').agg({
+    'distancia_centro_porteria': 'mean',
+    'angulo_porteria': 'mean',
+    'distancia_rival_mas_cercano': 'mean',
+    'distancia_finalizacion_portero': 'mean',
+    'gol_menos_xgot': 'mean'
+}).reset_index()
+metricas_equipos_defendiendo.rename(columns={
+    'possession_team_name': 'Equipo',
+    'distancia_centro_porteria': 'Distancia al Centro de la Portería',
+    'angulo_porteria': 'Ángulo de tiro respecto a la Portería',
+    'distancia_rival_mas_cercano': 'Distancia al Rival Más Cercano en Ángulo',
+    'distancia_finalizacion_portero': 'Distancia Finalización al Portero (m)',
+    'gol_menos_xgot': 'Gol - xGOT'
+}, inplace=True)
+
+metricas_equipos_defendiendo
+```
+
+Una vez calculada la tabla anterior, se va a realizar un PCA con el objetivo de reducir la dimensionalidad de los datos y poder visualizar qué equipos tienen perfiles similares en cuanto a las métricas calculadas.
+
+```{python}
+#| column: page
+#| fig-align: center
+
+
+# --- 1. PREPARACIÓN DE DATOS ---
+nombres_equipos = metricas_equipos_defendiendo.iloc[:, 0].values
+datos_numericos = metricas_equipos_defendiendo.iloc[:, 1:]
+nombres_variables = datos_numericos.columns
+
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(datos_numericos)
+
+# --- 2. APLICACIÓN DEL PCA ---
+pca = PCA(n_components=2)
+X_pca = pca.fit_transform(X_scaled)
+
+# --- 3. INTERPRETACIÓN NUMÉRICA ---
+
+# A) Varianza Explicada
+var_explicada = pca.explained_variance_ratio_
+print(f"--- RESUMEN DE VARIANZA ---")
+print(f"Componente 1 (PC1): {var_explicada[0]:.2%} de la información.")
+print(f"Componente 2 (PC2): {var_explicada[1]:.2%} de la información.")
+print(f"Total acumulado: {sum(var_explicada):.2%}\n")
+
+# B) Cargas (Loadings):
+cargas = pd.DataFrame(
+    pca.components_.T, 
+    columns=['PC1', 'PC2'], 
+    index=nombres_variables
+)
+
+print("--- PESO DE LAS VARIABLES (CARGAS) ---")
+print(cargas.sort_values(by='PC1', ascending=False))
+print("-" * 30)
+
+# --- 4. VISUALIZACIÓN PROFESIONAL (BIPLOT) ---
+plt.figure(figsize=(12, 10))
+sns.set_style("whitegrid") # Estilo limpio
+
+# A) Scatter Plot de los Equipos
+plt.scatter(X_pca[:, 0], X_pca[:, 1], c=X_pca[:, 0], cmap='viridis', s=100, alpha=0.7, edgecolors='k')
+
+# B) Etiquetas de los Equipos
+for i, nombre in enumerate(nombres_equipos):
+    plt.text(X_pca[i, 0] + 0.1, X_pca[i, 1] + 0.1, nombre, fontsize=9)
+
+# C) Proyección de las Variables Originales (Las Flechas)
+factor_escala = max(X_pca[:, 0]) * 0.8 
+
+for i, variable in enumerate(nombres_variables):
+    # Coordenadas de la flecha
+    x_arrow = pca.components_[0, i] * factor_escala
+    y_arrow = pca.components_[1, i] * factor_escala
+    
+    # Dibujamos la flecha
+    plt.arrow(0, 0, x_arrow, y_arrow, color='r', alpha=0.5, head_width=0.1)
+    
+    # Ponemos el nombre de la variable en la punta de la flecha
+    plt.text(x_arrow * 1.15, y_arrow * 1.15, variable, color='r', ha='center', va='center', fontsize=10, fontweight='bold')
+
+# D) Decoración Final
+plt.xlabel(f'Componente Principal 1 ({var_explicada[0]:.1%} var)', fontsize=12)
+plt.ylabel(f'Componente Principal 2 ({var_explicada[1]:.1%} var)', fontsize=12)
+plt.title('Mapa de Identidad Defensiva (PCA Biplot)', fontsize=16, fontweight='bold')
+plt.axhline(0, color='grey', linestyle='--', linewidth=0.8)
+plt.axvline(0, color='grey', linestyle='--', linewidth=0.8)
+
+plt.tight_layout()
+plt.show()
+```
+
+- PCA1: Al igual que cuando se hacía el análisis para los equipos en ataque, la PCA1 indica la posición desde la que tiran los rivales a la portería. Los equipos que se sitúan a la derecha son aquellos que le permiten al rival tiros lejanos, es decir, su labor defensiva consiste en no dejar que el rival se acerque a la portería. Por el contrario, los equipos que se sitúan a la izquierda permiten tiros cercanos.
+
+- PCA2: De nuevo, está definida por la diferencia entre Gol - xGOT. Los equipos que se sitúan en la parte superior permiten que el rival meta goles que, teóricamente, tenían baja probabilidad de entrar en la portería. Del otro lado, los equipos que se sitúan en la parte inferior, no permiten que entren goles que en principio tenían una alta probabilidad de entrar.
+
+- **Sevilla**: es el equipo que destaca en la zona superior de la gráfica. Significa que es el equipo al que más goles le encajan cuando la probabilidad era baja. Su posición centrada en 0 en el eje X indica un valor de PCA1 neutro, es decir, los rivales del Sevilla no tiran desde posiciones que se puedan calificar como especialmente cercanas o lejanas.
+
+- **Real Betis**: en el extremo contrario se sitúa el Betis. Esto refleja una calidad alta de su portero pues incluso teniendo una alta probabilidad de recibir un gol, conseguía pararlo. Su valor en PCA1 es cercano a -2, indicando que los rivales tienden a tirar desde más cerca, aunque tampoco excesivamente, ya que esta componente puede alcanzar valores negativos con un valor absoluto mucho más alto.
+
+- **Celta de Vigo**: al situarse en el lado izquierdo de la gráfica, siginifica que suelen permitir tiros más cercanos, es decir, dejan que los atacantes se acerquen más a su portería. Su valor en PCA2 no indica una diferencia especialmente notable entre los goles que reciben y la probabilidad que tenían de recibirlos.
+
+- **Girona, Real Sociedad o Mallorca**: Son los equipos que más tiros desde lejos reciben, es decir, los que menos dejan acercarse a los rivales a su portería (calidad de la defensa colectiva). La diferencia entre estos tres equipos es la calidad individual de portero. Mientras que el Girona recibe goles que era poco probable que recibiera, el Mallorca para goles que era altamente probable que recibiera. La Real Sociedad al estar cercano a 0 en PCA2, detiene y permite los goles que tenían poca o mucha probabilidad de entrar, respectivamente.
+
+# Análisis sobre las métricas avanzadas
+
+Se va a comenzar el análisis visualizando los valores que toman las métricas para distintos tipos de patrones de partido para tratar de identificar cuándo conviene usarla y cuándo no. Para ello: 
+
+```{python}
+analisis_limpieza = shots_360_limpio.groupby('play_pattern_name').agg({
+    'defensive_block_power': ['count', 'mean', 'std'],
+    'shooter_visibility': ['mean', 'std'],
+    'open_goal': ['mean', 'std']
+}).round(3)
+
+analisis_limpieza
+analisis_subtype = shots_360_limpio.groupby('sub_type_name').agg({
+    'defensive_block_power': ['count', 'mean'], 
+    'shooter_visibility': ['mean', 'std'],
+    'open_goal': ['mean', 'std']
+}).round(3)
+
+analisis_subtype
+
+analisis_body = shots_360_limpio.groupby('body_part_name').agg({
+    'defensive_block_power': ['count', 'mean', 'std'], 
+    'shooter_visibility': ['mean', 'std'],
+    'open_goal': ['mean']
+}).round(3)
+
+analisis_body
+```  
+
+Con el objetivo de hacer un análisis de mayor calidad sobre las métricas avanzadas propuestas, se realiza un filtrado de los datos para mantener únicamente los tiros que no sean: 
+
+- **Penaltis**: Son un evento estático, los valores de las variables serán siempre el mismo para todos los penaltis. 
+- **Remates de cabeza**: Ya que se ha realizado el cálculo en 2D, los tiros de cabeza no quedan bien representados en el análisis.
+- **Tiros libres directos**: La barrera es un bloqueo estático. Un equipo con muchas faltas tendría inflada la métrica de defensive block power.
+- **Saques de esquina**: Son situaciones de caos en el área y hay muchos jugadores juntos que alteran las métricas calculadas. 
+
+```{python}
+shots_360_limpio= shots_360_limpio[
+    ~shots_360_limpio['sub_type_name'].isin(['Penalty', 'Free Kick', 'Corner']) &
+    (shots_360_limpio['body_part_name'] != 'Head') &
+    (shots_360_limpio['play_pattern_name'] != 'From Corner')
+]
+
+print(shots_360_limpio.shape)
+```
+
+Tras el filtrado, se está en disposición de realizar un análisis más profundo sobre las métricas avanzadas propuestas. 
+
+```{python}
+# Cargamos los datos a un parquet para la app
+shots_360_limpio.to_parquet('shots_360_limpio_filtrado.parquet')
+del analisis_limpieza, analisis_subtype, analisis_body, metricas_equipos_atacando, metricas_equipos_defendiendo, datos_numericos, cargas
+```
+
+## Defensive Block Power vs Goles Encajados
+
+En este estudio, se va a visualizar agrupando por equipo, la media de la métrica Defensive Block Power y los goles encajados por cada equipo.
+
+```{python}
+#| column: page
+#| fig-align: center
+
+
+# Agrupación por equipo defensor
+metricas_defensivas_equipos = shots_360_limpio.groupby('defending_team_name').agg({
+    'defensive_block_power': 'mean',
+    'is_goal': 'sum'
+}).reset_index()
+
+# Visualización
+plt.figure(figsize=(12, 8))
+sns.scatterplot(
+    data=metricas_defensivas_equipos,
+    x='defensive_block_power',
+    y='is_goal',
+    s=100,
+    color='blue',
+    alpha=0.7,
+    edgecolor='k'
+)
+for i, row in metricas_defensivas_equipos.iterrows():
+    plt.text(row['defensive_block_power'] + 0.2, row['is_goal'] + 0.2, row['defending_team_name'], fontsize=9)
+plt.title('Defensive Block Power vs Goles Encajados por Equipo', fontsize=16, fontweight='bold')
+plt.xlabel('Defensive Block Power (Media por Equipo)', fontsize=12)
+plt.ylabel('Goles Encajados', fontsize=12)
+plt.grid(True)
+plt.show()
+```
+
+En esta gráfica se observa el poder defensivo media de los equipos (eje X) y se relaciona con los goles que recibe (eje Y). 
+Una posición más tendiente a la derecha en la gráfica indica un mayor poder defensivo, es decir, una defensa con más densidad o compactación. 
+Una posición que tienda hacia la parte superior indica un mayor número de goles que le han metido al equipo. 
+
+Por ejemplo, el **Real Valladolid** tiene un poder defensivo alto pero también muchos goles marcados, lo que indica que a pesar de tener una defensa buena, la interceptación del portero no es eficaz.
+
+En el caso del **Atlético de Madrid**, tiene un valor alto de *Defensive Block Power* y pocos goles recibidos. El valor en el eje de las X refleja que las defensas del equipo muy densas. El bajo valor en el eje Y sugiere además un rendimiento alto del portero.
+ 
+En el extremo izquierdo de la gráfica está el **Barcelona**, cuyo valor de *Defensive Block Power* es bajo y los goles que recibe son pocos. Sus defensas no son muy densas pero aún así no reciben muchos goles, indicando un rendimiento muy bueno del portero.
+
+## Shooter Visibility vs Goles Marcados
+
+```{python}
+#| column: page
+#| fig-align: center
+
+
+# Agrupación por equipo atacante
+metricas_ofensivas_equipos = shots_360_limpio.groupby('possession_team_name').agg({
+    'shooter_visibility': 'mean',
+    'is_goal': 'sum'
+}).reset_index()
+# Visualización
+plt.figure(figsize=(12, 8))
+sns.scatterplot(
+    data=metricas_ofensivas_equipos,
+    x='shooter_visibility',
+    y='is_goal',
+    s=100,
+    color='green',
+    alpha=0.7,
+    edgecolor='k'
+)
+for i, row in metricas_ofensivas_equipos.iterrows():
+    plt.text(row['shooter_visibility'] + 0.2, row['is_goal'] + 0.2, row['possession_team_name'], fontsize=9)
+plt.title('Shooter Visibility vs Goles Marcados por Equipo', fontsize=16, fontweight='bold')
+plt.xlabel('Shooter Visibility (Media por Equipo)', fontsize=12)
+plt.ylabel('Goles Marcados', fontsize=12)
+plt.grid(True)
+plt.show()
+```
+
+En esta gráfica se observa que la mayoría de equipos, independientemente de la visibilidad que tengan en el tiro, se sitúan en la parte inferior de la gráfica. Es decir, entre el Osasuna que se sitúa en el extremo izquierdo (menor visibilidad) y Las Palmas que se sitúa en el extremo derecho (mayor visibilidad), la diferencia en los goles que marcan no es especialmente notable.
+
+En la parte inferior del gráfico destacan la diferencia entre el **Real Betis**, **Athletic Club** y **Rayo Vallecano**, por un lado, y el **Deportivo Alavés** y **Real Valladolid**, por otro. Los tres primeros equipos, para una misma visibilidad (baja) que el Deportivo Alavés y el Real Valladolid, consiguen encajar más goles. Esto puede indicar un mejor rendimiento de los jugadores del Real Betis, el Athletic Club y el Rayo Vallecano, y sobre todo, menos dependiente de las condiciones visuales.
+
+En la parte media de la gráfica destacan el **Celta de Vigo**, el **Atlético de Madrid** y el **Villarreal**, que para una misma visibilidad que Las Palmas o el Sevilla por ejemplo, encajan más goles. Esto puede indicar que los jugadores son simplemente mejores y por tanto aprovechan mejor las ocasiones en las que la visibilidad es clara. Lo mismo ocurre con el **Barcelona**, situado en lo más alto de la gráfica.
+
+Por último, cabe mencionar que el **Real Madrid** es el segundo equipo que más goles encaja, a pesar de no tener la mejor visibilidad.
+
+Una conclusión que se puede obtener es que, aunque la visibilidad afecte al tiro, lo que principalmente determina su éxito es la calidad técnica del tirador. Es decir, un equipo con goleadores muy eficaces meterá más goles que los equipos con goleadores menos eficaces, aunque estos últimos tengan mejor visibilidad. 
+Cuando se enfrentan dos equipos cuyos jugadores dominan la técnica de finalización, entonces las condiciones de visibilidad si pueden marcar una diferencia entre el ganador o el perdedor.
+
+## Open Goal vs Goles Marcados
+
+```{python}
+#| column: page
+#| fig-align: center
+
+
+# Agrupación por equipo atacante
+metricas_open_goal_equipos = shots_360_limpio.groupby('possession_team_name').agg({
+    'open_goal': 'mean',
+    'is_goal': 'sum'
+}).reset_index()
+# Visualización
+plt.figure(figsize=(12, 8))
+sns.scatterplot(
+    data=metricas_open_goal_equipos,
+    x='open_goal',
+    y='is_goal',
+    s=100,
+    color='orange',
+    alpha=0.7,
+    edgecolor='k'
+)
+for i, row in metricas_open_goal_equipos.iterrows():
+    plt.text(row['open_goal'] + 0.2, row['is_goal'] + 0.2, row['possession_team_name'], fontsize=9)
+plt.title('Open Goal vs Goles Marcados por Equipo', fontsize=16, fontweight='bold')
+plt.xlabel('Open Goal (Media por Equipo)', fontsize=12)
+plt.ylabel('Goles Marcados', fontsize=12)
+plt.grid(True)
+plt.show()
+```
+
+En esta visualización se observa la cantidad de goles marcados en función de la media de Open Goal (el porcentaje de portería libre teniendo en cuenta compañeros, rivales y portero). Se observa una ligera tendencia hacia arriba, demostrando que cuanto más porcentaje de la portería esté libre, más goles entran en la portería.
+Sin embargo, cabe remarcar que la distribución de los equipos es similar a la anterior, reforzando la idea de la importancia de la calidad del tiro por encima de condiciones de visibilidad u ocupación de la portería.
+
+```{python}
+del metricas_defensivas_equipos, metricas_ofensivas_equipos, metricas_open_goal_equipos
+```
+
+## Defensive Block Power vs xGOT concedido
+
+```{python}
+#| column: page
+#| fig-align: center
+
+
+# Agrupación por equipo defensor
+metricas_defensivas_equipos_xgot = shots_360_limpio.groupby('defending_team_name').agg({
+    'defensive_block_power': 'mean',
+    'shot_shot_execution_xg': 'mean'
+}).reset_index()
+
+# Visualización
+plt.figure(figsize=(12, 8))
+sns.scatterplot(
+    data=metricas_defensivas_equipos_xgot,
+    x='defensive_block_power',
+    y='shot_shot_execution_xg',
+    s=100,
+    color='purple',
+    alpha=0.7,
+    edgecolor='k'
+)
+for i, row in metricas_defensivas_equipos_xgot.iterrows():
+    plt.text(row['defensive_block_power']+ 0.2, row['shot_shot_execution_xg']+ 0.001, row['defending_team_name'], fontsize=9)
+plt.title('Defensive Block Power vs xGOT Concedido por Equipo', fontsize=16, fontweight='bold')
+plt.xlabel('Defensive Block Power (Media por Equipo)', fontsize=12)
+plt.ylabel('xGOT Concedido (Media por Equipo)', fontsize=12)
+plt.grid(True)
+plt.show()
+
+```
+
+En esta visualización se puede comprobar que a mayor *Defensive Block Power*, menor xGOT concedido. Esto indica que si los equipos bloquean mejor los tiros rivales, conceden tiros con menos probabilidad de entrar.  Esto puede resultar en dos escenarios:
+
+- Un tiro fallado, concorde a la probabilidad que tenía.
+- Un gol que ha entrado teniendo muy poca probabilidad, lo que, como ya se analizaba en apartados anteriores, puede hablar de una muy buena ejecución del tirador o de un mal rendimiento del portero.
+
+## Defensive Block Power vs Ratio Goles Encajados / Tiros Recibidos
+
+::: {.callout-note}
+En los apartados anteriores se han comparado las métricas avanzadas con el número de goles. Sin embargo, dicha comparación puede no ser totalmente fiel a la realidad, pues se pierde precisión al ignorar los tiros que no fueron gol. 
+Por ejemplo, se puede pensar que el portero de un equipo con alto *Defensive Block Power* rinde mal por recibir muchos goles, pero no se está teniendo en cuenta el número de tiros que ha recibido e interceptado. 
+Por ello, en este apartado y los que siguen se calcula el ratio de goles/tiros para comprobar cómo se comportan las métricas avanzadas.
+:::
+
+En esta visualización, se busca analizar si existe una relación entre la eficacia defensiva del equipo (*Defensive Block Power*) y el ratio de goles encajados por tiros recibidos.
+
+```{python}
+#| column: page
+#| fig-align: center
+
+# Agrupación por equipo defensor
+metricas_defensivas_equipos_ratio = shots_360_limpio.groupby('defending_team_name').agg({
+    'defensive_block_power': 'mean',
+    'is_goal': 'sum',
+    'id': 'count'
+}).reset_index()
+
+# Cálculo del ratio goles encajados / tiros recibidos
+metricas_defensivas_equipos_ratio['goles_por_tiro'] = (
+    metricas_defensivas_equipos_ratio['is_goal'] / metricas_defensivas_equipos_ratio['id']
+)
+# Visualización
+plt.figure(figsize=(12, 8))
+sns.scatterplot(
+    data=metricas_defensivas_equipos_ratio,
+    x='defensive_block_power',
+    y='goles_por_tiro',
+    s=100,
+    color='brown',
+    alpha=0.7,
+    edgecolor='k'
+)
+for i, row in metricas_defensivas_equipos_ratio.iterrows():
+    plt.text(row['defensive_block_power'] + 0.2, row['goles_por_tiro'] + 0.002, row['defending_team_name'], fontsize=9)
+plt.title('Defensive Block Power vs Ratio Goles Encajados / Tiros Recibidos por Equipo', fontsize=16, fontweight='bold')
+plt.xlabel('Defensive Block Power (Media por Equipo)', fontsize=12)
+plt.ylabel('Ratio Goles Encajados / Tiros Recibidos', fontsize=12)
+plt.grid(True)
+plt.show()
+```
+
+El ratio será más bajo cuando la cantidad de goles encajados sea mucho menor que la de goles recibidos. Es decir, un equipo puede haber recibido muchos goles pero tener un ratio muy bajo por tener mucha cantidad de tiros recibidos que no se han convertido en gol. En el extremo contrario, un equipo puede haber recibido pocos tiros, pero que todos hayan resultado en gol, lo que hará que el ratio sea muy alto.
+
+Se observa una tendencia general en la que a medida que va aumentando el Defensive Block Power, disminuye el ratio gol encajado / tiro recibido.
+
+Los equipos que más se distinguen de esta tendencia son el Barcelona, el Real Valladolid, el Atlético de Madrid y el Leganés.
+
+Un equipo que se sitúe en lo alto de la gráfica y a la izquierda, como es el **Barcelona**, tendrá un valor bajo de *Defensive Block Power* y un ratio gol/tiro alto. 
+
+Por las gráficas anteriores se sabe que al Barcelona le meten pocos goles. Sin embargo, su ratio tan alto indica que de los pocos que le llegan, muchos acaban en gol, posiblemente fruto de una defensa poco densa.
+
+En el extremo contrario, el **Real Valladolid** tiene un ratio muy alto a pesar de tener un valor de *Defensive Block Power* alto. Conociendo que el número de goles que recibe también es alto, se pone de manifiesto la falta de eficacia de su sistema defensivo grupal y puede que del portero.
+
+En la zona inferior de la gráfica se encuentran el Atlético de Madrid y el Leganés.
+El **Atlético de Madrid** tiene un *Defensive Block Power* alto y el más bajo de los ratios. Además, en el gráfico anterior se veía que recibía pocos goles. Aquí se refleja una eficacia del sistema defensivo grupal y del portero.
+
+Al compararse con el **Leganés**, se ve que tiene un *Defensive Block Power* y un ratio más alto, lo que implica que con más defensa, más tiros de los que le llegan se convierten en gol.
+
+## Shooter Visibility vs Ratio Goles Marcados / Tiros Realizados
+
+```{python}
+#| column: page
+#| fig-align: center
+
+# Agrupación por equipo atacante
+metricas_ofensivas_equipos_ratio = shots_360_limpio.groupby('possession_team_name').agg({
+    'shooter_visibility': 'mean',
+    'is_goal': 'sum',
+    'id': 'count'
+}).reset_index()
+# Cálculo del ratio goles marcados / tiros realizados
+metricas_ofensivas_equipos_ratio['goles_por_tiro'] = (
+    metricas_ofensivas_equipos_ratio['is_goal'] / metricas_ofensivas_equipos_ratio['id']
+)
+# Visualización
+plt.figure(figsize=(12, 8))
+sns.scatterplot(
+    data=metricas_ofensivas_equipos_ratio,
+    x='shooter_visibility',
+    y='goles_por_tiro',
+    s=100,
+    color='cyan',
+    alpha=0.7,
+    edgecolor='k'
+)
+for i, row in metricas_ofensivas_equipos_ratio.iterrows():
+    plt.text(row['shooter_visibility'] + 0.2, row['goles_por_tiro'] + 0.002, row['possession_team_name'], fontsize=9)
+plt.title('Shooter Visibility vs Ratio Goles Marcados / Tiros Realizados por Equipo', fontsize=16, fontweight='bold')
+plt.xlabel('Shooter Visibility (Media por Equipo)', fontsize=12)
+plt.ylabel('Ratio Goles Marcados / Tiros Realizados', fontsize=12)
+plt.grid(True)
+plt.show()
+```
+
+Se observa una ligera tendencia ascendente, donde a más porcentaje de visibilidad del tirador, mayor ratio de goles marcados por tiros realizados. Es decir, en general, cuanto mayor sea la visibilidad, un mayor número de tiros se convertirán en gol.
+
+Destaca el **Barcelona**, pues para un porcentaje de visibilidad similar al de otros muchos equipos como el Real Madrid, el Real Betis o el Atlético de Bilbao, tiene un ratio de conversión mucho más alto, reflejando una calidad técnica de sus jugadores fuerte ante condiciones que no son las más favorables.
+El **Celta de Vigo** también tiene un ratio de conversión bastante alto con peores condiciones de visbilidad que el Barcelona.
+Los equipos que están en el extremo derecho e inferior de la gráfica son los que a pesar de tener buenas condiciones de vsibilidad no convierten sus tiros en goles, reflejando una falta de habilidad técnica.
+
+## Open Goal vs Ratio Goles Marcados / Tiros Realizados
+
+```{python}
+#| column: page
+#| fig-align: center
+
+# Agrupación por equipo atacante
+metricas_open_goal_equipos_ratio = shots_360_limpio.groupby('possession_team_name').agg({
+    'open_goal': 'mean',
+    'is_goal': 'sum',
+    'id': 'count'
+}).reset_index()
+# Cálculo del ratio goles marcados / tiros realizados
+metricas_open_goal_equipos_ratio['goles_por_tiro'] = (
+    metricas_open_goal_equipos_ratio['is_goal'] / metricas_open_goal_equipos_ratio['id']
+)
+# Visualización
+plt.figure(figsize=(12, 8))
+sns.scatterplot(
+    data=metricas_open_goal_equipos_ratio,
+    x='open_goal',
+    y='goles_por_tiro',
+    s=100,
+    color='magenta',
+    alpha=0.7,
+    edgecolor='k'
+)
+for i, row in metricas_open_goal_equipos_ratio.iterrows():
+    plt.text(row['open_goal'] + 0.2, row['goles_por_tiro'] + 0.002, row['possession_team_name'], fontsize=9)
+plt.title('Open Goal vs Ratio Goles Marcados / Tiros Realizados por Equipo', fontsize=16, fontweight='bold')
+plt.xlabel('Open Goal (Media por Equipo)', fontsize=12)
+plt.ylabel('Ratio Goles Marcados / Tiros Realizados', fontsize=12)
+plt.grid(True)
+plt.show()
+```
+
+En esta gráfica también se observa una ligera tendencia hacia arriba, indicando más ratio de conversión cuanto más libre se encuentra la portería. La colocación de la mayoría de los equipos es similar a la gráfica "Shooter Visibility vs Ratio Goles Marcados / Tiros realizados".
+
+Los equipos que tenían buena visibilidad y la aprovechaban para convertir sus tiros en goles son los mismos que teniendo un porcentaje alto de portería libre consiguen meter muchos goles. De igual forma, los equipos que no metían tantos goles teniendo buena visibilidad son los mismos que no meten tantos goles a pesar de tener un porcentaje libre de portería alto.
+
+De nuevo, corroborando lo que ya se veía en las gráficas donde se comparaban el *Shooter Visibility* y el *Open Goal* con el número de goles marcados, el rendimiento en el tiro no depende tanto de las condiciones de visibilidad y libertad de la portería sino de la ejecución técnica del lanzamiento.
+
+# Línea futura de análisis
+
+## Tendencia de perfiles de finalización de extremos en función de la zona de lanzamiento y su pierna de lanzamiento
+
+En este apartado se busca analizar si los extremos tienden a finalizar más desde ciertas zonas del campo dependiendo de su pierna de lanzamiento (izquierda o derecha). La hipótesis plantea que los extremos en banda izquierda finalizaran más con la pierna derecha y viceversa.
+
+En primer lugar hay que crear el campo y separarlo en 2 zonas principales: 
+
+- Zona izquierda: desde la banda izquierda hasta el centro del campo. 
+- Zona derecha: desde el centro del campo hasta la banda derecha.
+
+Por otro lado se diferencia entre la zona del área y fuera del área.
+
+```{python}
+def divided_pitch(figsize=(12, 8)):
+    def custom_pitch(color="#eceaeaff", line_color='black', half=False):
+        """Crea un objeto Pitch personalizado para StatsBomb.
+
+        - color: color de fondo del terreno
+        - line_color: color de las líneas
+        - half: si True solicita a mplsoccer que dibuje solo media cancha (parámetro `half` de Pitch si está disponible)
+        """
+        # Pasamos `half` a Pitch; algunas versiones de mplsoccer soportan este argumento
+        try:
+            pitch = Pitch(pitch_type='statsbomb', pitch_color=color, line_color=line_color, half=half)
+        except TypeError:
+            # fallback si la versión de mplsoccer no soporta `half`
+            pitch = Pitch(pitch_type='statsbomb', pitch_color=color, line_color=line_color)
+        return pitch
+
+    # Crear campo con zonas izquierda y derecha
+
+    pitch = custom_pitch(half=True)
+    fig, ax = pitch.draw(figsize=(figsize))
+
+    # Dibujar línea divisoria 2 zonas
+    ax.plot([0, 120], [40, 40], color='red', linestyle='--', linewidth=2, zorder=5)
+
+    # Dibujar zona dentro del area
+    ax.fill_betweenx([18, 62], 102, 120, color='lightblue', alpha=0.3, zorder=1)
+
+    return fig, ax
+
+fig, ax = divided_pitch()
+```
+
+A continuación, se filtran los datos para obtener solo los tiros realizados por extremos, diferenciando entre pierna izquierda y derecha. Seguidamente, se clasifican los tiros según la zona desde la que se realizaron (izquierda o derecha) y si fueron dentro o fuera del área.
+
+```{python}
+
+
+
+fig, ax = divided_pitch(figsize=(14, 10))
+
+# Dibujar línea divisoria entre zonas
+ax.plot([0, 120], [40, 40], color='red', linestyle='--', linewidth=2, zorder=5, alpha=0.7)
+
+# Dibujar zona dentro del área
+ax.fill_betweenx([18, 62], 102, 120, color='lightblue', alpha=0.2, zorder=1)
+
+# Filtrar extremos
+extremos = shots_360_limpio[shots_360_limpio['position_name'].isin(['Left Wing', 'Right Wing'])].copy()
+
+# Clasificar por banda y zona de lanzamiento
+def clasificar_tiros_banda(df):
+    df = df.copy()
+    df['zona_lanzamiento'] = np.where(df['y'] < 40, 'izquierda', 'derecha')
+    df['dentro_area'] = ((df['x'] >= 102) & (df['y'] >= 18) & (df['y'] <= 62)).astype(bool)
+    return df
+
+if not extremos.empty:
+    extremos = clasificar_tiros_banda(extremos)
+    
+    def calcular_stats_completas(df):
+        stats = {}
+        for zona in ['izquierda', 'derecha']:
+            zona_df = df[df['zona_lanzamiento'] == zona]
+            total_zona = len(zona_df)
+            
+            izq_pie = zona_df[zona_df['body_part_name'] == 'Left Foot']
+            der_pie = zona_df[zona_df['body_part_name'] == 'Right Foot']
+            
+            stats[zona] = {
+                'total': total_zona,
+                'izq_pie': {
+                    'total': len(izq_pie),
+                    'dentro': len(izq_pie[izq_pie['dentro_area']]),
+                    'fuera': len(izq_pie[~izq_pie['dentro_area']])
+                },
+                'der_pie': {
+                    'total': len(der_pie),
+                    'dentro': len(der_pie[der_pie['dentro_area']]),
+                    'fuera': len(der_pie[~der_pie['dentro_area']])
+                }
+            }
+        return stats
+    
+    stats = calcular_stats_completas(extremos)
+    
+    def calc_pct(valor, total):
+        return (valor / total * 100) if total > 0 else 0
+    
+    # Posiciones mejoradas para las etiquetas
+    x_fuera_area = 85
+    x_dentro_area = 111
+    y_izq = 20
+    y_der = 60
+    
+    # BANDA IZQUIERDA
+    total_izq = stats['izquierda']['total']
+    izq_izq = stats['izquierda']['izq_pie']
+    izq_der = stats['izquierda']['der_pie']
+    
+    # Títulos de banda
+    ax.text(100, y_izq - 15, "BANDA IZQUIERDA", 
+            ha='center', va='center', fontsize=14, fontweight='bold', color='darkblue',
+            bbox=dict(boxstyle='round,pad=0.5', facecolor='lightblue', alpha=0.8, edgecolor='darkblue'))
+    
+    # Etiquetas para banda izquierda - Fuera área
+    ax.text(x_fuera_area, y_izq - 5, "FUERA DEL ÁREA", 
+            ha='center', va='center', fontsize=9, color='darkred', fontweight='bold', style='italic')
+    
+    ax.text(x_fuera_area, y_izq - 2, f"IZQ: {calc_pct(izq_izq['fuera'], total_izq):.0f}%",
+            ha='center', va='center', fontsize=11, color='white', fontweight='bold',
+            bbox=dict(boxstyle='round,pad=0.4', facecolor='blue', alpha=0.9))
+    
+    ax.text(x_fuera_area, y_izq + 2, f"DER: {calc_pct(izq_der['fuera'], total_izq):.0f}%",
+            ha='center', va='center', fontsize=11, color='white', fontweight='bold',
+            bbox=dict(boxstyle='round,pad=0.4', facecolor='green', alpha=0.9))
+    
+    # Etiquetas para banda izquierda - Dentro área
+    ax.text(x_dentro_area, y_izq - 5, "DENTRO DEL ÁREA",
+            ha='center', va='center', fontsize=9, color='darkgreen', fontweight='bold', style='italic')
+    
+    ax.text(x_dentro_area, y_izq - 2, f"IZQ: {calc_pct(izq_izq['dentro'], total_izq):.0f}%",
+            ha='center', va='center', fontsize=11, color='white', fontweight='bold',
+            bbox=dict(boxstyle='round,pad=0.4', facecolor='blue', alpha=0.9))
+    
+    ax.text(x_dentro_area, y_izq + 2, f"DER: {calc_pct(izq_der['dentro'], total_izq):.0f}%",
+            ha='center', va='center', fontsize=11, color='white', fontweight='bold',
+            bbox=dict(boxstyle='round,pad=0.4', facecolor='green', alpha=0.9))
+    
+    # BANDA DERECHA
+    total_der = stats['derecha']['total']
+    der_izq = stats['derecha']['izq_pie']
+    der_der = stats['derecha']['der_pie']
+    
+    # Títulos de banda
+    ax.text(100, y_der + 15, "BANDA DERECHA",
+            ha='center', va='center', fontsize=14, fontweight='bold', color='darkred',
+            bbox=dict(boxstyle='round,pad=0.5', facecolor='lightcoral', alpha=0.8, edgecolor='darkred'))
+    
+    # Etiquetas para banda derecha - Fuera área
+    ax.text(x_fuera_area, y_der - 5, "FUERA DEL ÁREA",
+            ha='center', va='center', fontsize=9, color='darkred', fontweight='bold', style='italic')
+    
+    ax.text(x_fuera_area, y_der - 2, f"IZQ: {calc_pct(der_izq['fuera'], total_der):.0f}%",
+            ha='center', va='center', fontsize=11, color='white', fontweight='bold',
+            bbox=dict(boxstyle='round,pad=0.4', facecolor='blue', alpha=0.9))
+    
+    ax.text(x_fuera_area, y_der + 2, f"DER: {calc_pct(der_der['fuera'], total_der):.0f}%",
+            ha='center', va='center', fontsize=11, color='white', fontweight='bold',
+            bbox=dict(boxstyle='round,pad=0.4', facecolor='green', alpha=0.9))
+    
+    # Etiquetas para banda derecha - Dentro área
+    ax.text(x_dentro_area, y_der - 5, "DENTRO DEL ÁREA",
+            ha='center', va='center', fontsize=9, color='darkgreen', fontweight='bold', style='italic')
+    
+    ax.text(x_dentro_area, y_der - 2, f"IZQ: {calc_pct(der_izq['dentro'], total_der):.0f}%",
+            ha='center', va='center', fontsize=11, color='white', fontweight='bold',
+            bbox=dict(boxstyle='round,pad=0.4', facecolor='blue', alpha=0.9))
+    
+    ax.text(x_dentro_area, y_der + 2, f"DER: {calc_pct(der_der['dentro'], total_der):.0f}%",
+            ha='center', va='center', fontsize=11, color='white', fontweight='bold',
+            bbox=dict(boxstyle='round,pad=0.4', facecolor='green', alpha=0.9))
+    
+    # Leyenda explicativa
+    ax.text(75, 2, "IZQ = Pie izquierdo | DER = Pie derecho", 
+            ha='center', va='center', fontsize=10, color='gray', style='italic')
+    
+    # Título principal mejorado
+    total_general = len(extremos)
+    ax.set_title(f"ANÁLISIS DE TIROS DE EXTREMOS - DISTRIBUCIÓN POR PIERNA Y ZONA\n"
+                 f"Total: {total_general} tiros | Izquierda: {total_izq} ({calc_pct(total_izq, total_general):.0f}%) | "
+                 f"Derecha: {total_der} ({calc_pct(total_der, total_general):.0f}%)",
+                 fontsize=14, fontweight='bold', pad=25)
+
+fig.tight_layout()
+```
+
+En la gráfica se observa como para ambas bandas, los extremos tienden a finalizar más con la pierna contraria a la banda en la que se encuentran, tanto dentro como fuera del área. Esto sugiere que los extremos prefieren cortar hacia el centro para tener una mejor posición de disparo con su pierna dominante (en el caso de estar a banda cambiada).
+
+Para medir realmente la efectividad de cada lanzamiento en cada zona en función del pie, a continuación se muestran en el mismo gráfico los **xG** y **xGOT** asociados a cada pierna y zona de lanzamiento.
+
+```{python}
+
+fig, ax = divided_pitch(figsize=(14, 10))
+
+# Dibujar línea divisoria entre zonas
+ax.plot([0, 120], [40, 40], color='red', linestyle='--', linewidth=2, zorder=5, alpha=0.7)
+
+# Dibujar zona dentro del área
+ax.fill_betweenx([18, 62], 102, 120, color='lightblue', alpha=0.2, zorder=1)
+
+# Filtrar extremos
+extremos = shots_360_limpio[shots_360_limpio['position_name'].isin(['Left Wing', 'Right Wing'])].copy()
+
+# Clasificar por banda y zona de lanzamiento
+def clasificar_tiros_banda(df):
+    df = df.copy()
+    df['zona_lanzamiento'] = np.where(df['y'] < 40, 'izquierda', 'derecha')
+    df['dentro_area'] = ((df['x'] >= 102) & (df['y'] >= 18) & (df['y'] <= 62)).astype(bool)
+    return df
+
+if not extremos.empty:
+    extremos = clasificar_tiros_banda(extremos)
+    
+    def calcular_stats_xg(df):
+        stats = {}
+        for zona in ['izquierda', 'derecha']:
+            zona_df = df[df['zona_lanzamiento'] == zona]
+            
+            izq_pie = zona_df[zona_df['body_part_name'] == 'Left Foot']
+            der_pie = zona_df[zona_df['body_part_name'] == 'Right Foot']
+            
+            stats[zona] = {
+                'izq_pie': {
+                    'xg_dentro': izq_pie[izq_pie['dentro_area']]['shot_statsbomb_xg'].sum(),
+                    'xg_fuera': izq_pie[~izq_pie['dentro_area']]['shot_statsbomb_xg'].sum(),
+                    'xgot_dentro': izq_pie[izq_pie['dentro_area']]['shot_shot_execution_xg'].sum(),
+                    'xgot_fuera': izq_pie[~izq_pie['dentro_area']]['shot_shot_execution_xg'].sum()
+                },
+                'der_pie': {
+                    'xg_dentro': der_pie[der_pie['dentro_area']]['shot_statsbomb_xg'].sum(),
+                    'xg_fuera': der_pie[~der_pie['dentro_area']]['shot_statsbomb_xg'].sum(),
+                    'xgot_dentro': der_pie[der_pie['dentro_area']]['shot_shot_execution_xg'].sum(),
+                    'xgot_fuera': der_pie[~der_pie['dentro_area']]['shot_shot_execution_xg'].sum()
+                }
+            }
+        return stats
+    
+    stats = calcular_stats_xg(extremos)
+    
+    # Posiciones mejoradas para las etiquetas
+    x_fuera_area = 85
+    x_dentro_area = 111
+    y_izq = 20
+    y_der = 60
+    
+    # BANDA IZQUIERDA
+    izq_izq = stats['izquierda']['izq_pie']
+    izq_der = stats['izquierda']['der_pie']
+    
+    # Títulos de banda
+    ax.text(100, y_izq - 15, "BANDA IZQUIERDA", 
+            ha='center', va='center', fontsize=14, fontweight='bold', color='darkblue',
+            bbox=dict(boxstyle='round,pad=0.5', facecolor='lightblue', alpha=0.8, edgecolor='darkblue'))
+    
+    # Etiquetas para banda izquierda - Fuera área
+    ax.text(x_fuera_area, y_izq - 5, "FUERA DEL ÁREA", 
+            ha='center', va='center', fontsize=9, color='darkred', fontweight='bold', style='italic')
+    
+    ax.text(x_fuera_area, y_izq - 2, f"IZQ: xG={izq_izq['xg_fuera']:.2f} | xGOT={izq_izq['xgot_fuera']:.2f}",
+            ha='center', va='center', fontsize=9, color='white', fontweight='bold',
+            bbox=dict(boxstyle='round,pad=0.4', facecolor='blue', alpha=0.9))
+    
+    ax.text(x_fuera_area, y_izq + 2, f"DER: xG={izq_der['xg_fuera']:.2f} | xGOT={izq_der['xgot_fuera']:.2f}",
+            ha='center', va='center', fontsize=9, color='white', fontweight='bold',
+            bbox=dict(boxstyle='round,pad=0.4', facecolor='green', alpha=0.9))
+    
+    # Etiquetas para banda izquierda - Dentro área
+    ax.text(x_dentro_area, y_izq - 5, "DENTRO DEL ÁREA",
+            ha='center', va='center', fontsize=9, color='darkgreen', fontweight='bold', style='italic')
+    
+    ax.text(x_dentro_area, y_izq - 2, f"IZQ: xG={izq_izq['xg_dentro']:.2f} | xGOT={izq_izq['xgot_dentro']:.2f}",
+            ha='center', va='center', fontsize=9, color='white', fontweight='bold',
+            bbox=dict(boxstyle='round,pad=0.4', facecolor='blue', alpha=0.9))
+    
+    ax.text(x_dentro_area, y_izq + 2, f"DER: xG={izq_der['xg_dentro']:.2f} | xGOT={izq_der['xgot_dentro']:.2f}",
+            ha='center', va='center', fontsize=9, color='white', fontweight='bold',
+            bbox=dict(boxstyle='round,pad=0.4', facecolor='green', alpha=0.9))
+    
+    # BANDA DERECHA
+    der_izq = stats['derecha']['izq_pie']
+    der_der = stats['derecha']['der_pie']
+    
+    # Títulos de banda
+    ax.text(100, y_der + 15, "BANDA DERECHA",
+            ha='center', va='center', fontsize=14, fontweight='bold', color='darkred',
+            bbox=dict(boxstyle='round,pad=0.5', facecolor='lightcoral', alpha=0.8, edgecolor='darkred'))
+    
+    # Etiquetas para banda derecha - Fuera área
+    ax.text(x_fuera_area, y_der - 5, "FUERA DEL ÁREA",
+            ha='center', va='center', fontsize=9, color='darkred', fontweight='bold', style='italic')
+    
+    ax.text(x_fuera_area, y_der - 2, f"IZQ: xG={der_izq['xg_fuera']:.2f} | xGOT={der_izq['xgot_fuera']:.2f}",
+            ha='center', va='center', fontsize=9, color='white', fontweight='bold',
+            bbox=dict(boxstyle='round,pad=0.4', facecolor='blue', alpha=0.9))
+    
+    ax.text(x_fuera_area, y_der + 2, f"DER: xG={der_der['xg_fuera']:.2f} | xGOT={der_der['xgot_fuera']:.2f}",
+            ha='center', va='center', fontsize=9, color='white', fontweight='bold',
+            bbox=dict(boxstyle='round,pad=0.4', facecolor='green', alpha=0.9))
+    
+    # Etiquetas para banda derecha - Dentro área
+    ax.text(x_dentro_area, y_der - 5, "DENTRO DEL ÁREA",
+            ha='center', va='center', fontsize=9, color='darkgreen', fontweight='bold', style='italic')
+    
+    ax.text(x_dentro_area, y_der - 2, f"IZQ: xG={der_izq['xg_dentro']:.2f} | xGOT={der_izq['xgot_dentro']:.2f}",
+            ha='center', va='center', fontsize=9, color='white', fontweight='bold',
+            bbox=dict(boxstyle='round,pad=0.4', facecolor='blue', alpha=0.9))
+    
+    ax.text(x_dentro_area, y_der + 2, f"DER: xG={der_der['xg_dentro']:.2f} | xGOT={der_der['xgot_dentro']:.2f}",
+            ha='center', va='center', fontsize=9, color='white', fontweight='bold',
+            bbox=dict(boxstyle='round,pad=0.4', facecolor='green', alpha=0.9))
+    
+    # Leyenda explicativa
+    ax.text(75, 2, "IZQ = Pie izquierdo | DER = Pie derecho | xG = Expected Goals | xGOT = Post-Shot xG", 
+            ha='center', va='center', fontsize=9, color='gray', style='italic')
+    
+    # Calcular totales para el título
+    total_xg = extremos['shot_statsbomb_xg'].sum()
+    total_xgot = extremos['shot_shot_execution_xg'].sum()
+    
+    # Título principal mejorado
+    ax.set_title(f"ANÁLISIS DE TIROS DE EXTREMOS - xG Y xGOT POR PIERNA Y ZONA\n"
+                 f"xG Total: {total_xg:.2f} | xGOT Total: {total_xgot:.2f} | Mejora: {(total_xgot - total_xg):.2f}",
+                 fontsize=14, fontweight='bold', pad=25)
+
+fig.tight_layout()
+```
+
+Se observa como efectivamente, los extremos generan más xG y xGOT cuando finalizan con la pierna contraria a la banda en la que se encuentran, tanto dentro como fuera del área. Esto sugiere que los extremos no solo prefieren cortar hacia el centro para tener una mejor posición de disparo con su pierna dominante, sino que esta estrategia también resulta en oportunidades de gol más efectivas.

@@ -1,0 +1,306 @@
+---
+title: "Análisis de la toma de decisión en Tiros en la Bundesliga 2023/24"
+author:
+  - Alonso González Romero
+  - Daniel López Paredes
+  - Alba Martínez de la Hermosa
+date: today
+format:
+  html:
+    page-layout: full  
+    css: style.css
+    embed-resources: true
+    plotly-connected: true
+    toc: true
+    toc-depth: 3
+    number-sections: true
+lang: es
+abstract: |
+    En este análisis, exploramos la toma de decisiones en los tiros realizados durante la temporada 2023/24 de la Bundesliga. Utilizando datos detallados de eventos, examinamos cómo los jugadores eligen cuándo y dónde disparar, y cómo estas decisiones afectan el resultado del juego. A través de visualizaciones interactivas y análisis estadísticos, buscamos identificar patrones y tendencias en la toma de decisiones de los jugadores, proporcionando insights valiosos para entrenadores, analistas y aficionados al fútbol.
+---
+
+# Introducción
+
+# Importamos las librerías necesarias
+
+```{python}
+import pandas as pd
+import json
+import numpy as np
+import mplsoccer
+from mplsoccer import Sbopen
+from mplsoccer import Sblocal
+from mplsoccer import Pitch
+import matplotlib.pyplot as plt
+# from itables import show
+# import plotly.graph_objects as go
+# import numpy as np
+# import os
+# import math
+# import matplotlib.cm as cm
+# import matplotlib.patches as patches
+# import seaborn as sns
+```
+
+# Crear un DataFrame con los eventos de tiro
+```{python}
+all_shots_360 = pd.read_parquet('data_processed/all_shots_360_processed.parquet')
+
+cols_json = ['posiciones_compañeros', 'posiciones_rivales', 'posiciones_porteros']
+for col in cols_json:
+  if col in all_shots_360.columns:
+    all_shots_360[col] = all_shots_360[col].apply(
+      lambda x: json.loads(x) if isinstance(x, str) and x else (x if isinstance(x, list) else [])
+    )
+
+shots_360_limpio = all_shots_360.copy()
+
+shots_360_limpio.head()
+```
+
+# Métricas geométricas de tiro
+
+En esta sección se implementan, paso a paso, las métricas espaciales para que queden guardadas en el DataFrame:
+
+- Distancia del disparo al centro de la portería (`distancia_centro_porteria`).
+- Ángulo de tiro con la portería (`angulo_porteria`).
+- Rivales dentro del ángulo balón-portería (`rivales_en_angulo` y `num_rivales_angulo`).
+- Distancia al rival más cercano dentro de ese ángulo (`distancia_rival_mas_cercano`).
+
+## Paso 1. Distancia del disparo al centro de la portería
+
+```{python}
+shots_360_limpio['distancia_centro_porteria'] = shots_360_limpio.apply(
+  lambda row: ((120 - row['x'])**2 + (40 - row['y'])**2)**0.5,
+  axis=1,
+)
+
+shots_360_limpio[['x', 'y', 'distancia_centro_porteria']].head()
+```
+
+## Paso 2. Ángulo con la portería
+
+```{python}
+shots_360_limpio['angulo_porteria'] = shots_360_limpio.apply(
+  lambda row: np.degrees(
+    np.arccos(
+      np.clip(
+        (
+          (120 - row['x'])**2 + (36 - row['y']) * (44 - row['y'])
+        )
+        /
+        (
+          ((120 - row['x'])**2 + (36 - row['y'])**2)**0.5
+          *
+          ((120 - row['x'])**2 + (44 - row['y'])**2)**0.5
+        ),
+        -1.0,
+        1.0,
+      )
+    )
+  ),
+  axis=1,
+)
+
+shots_360_limpio[['x', 'y', 'angulo_porteria']].head()
+```
+
+## Paso 3. Jugadores en el ángulo balón-portería
+
+```{python}
+POSTE_1 = (120, 36)
+POSTE_2 = (120, 44)
+
+
+def punto_en_triangulo(x_player, y_player, x_ball, y_ball):
+  # El jugador debe estar por delante del balón
+  if x_player <= x_ball:
+    return False
+
+  xA, yA = x_ball, y_ball
+  xB, yB = POSTE_1
+  xC, yC = POSTE_2
+  xP, yP = x_player, y_player
+
+  delta = (yB - yC) * (xA - xC) + (xC - xB) * (yA - yC)
+  if delta == 0:
+    return False
+
+  w1 = ((yB - yC) * (xP - xC) + (xC - xB) * (yP - yC)) / delta
+  w2 = ((yC - yA) * (xP - xC) + (xA - xC) * (yP - yC)) / delta
+
+  return w1 >= 0 and w2 >= 0 and (w1 + w2) <= 1
+
+
+def procesar_jugadores_y_angulo(row, columna_jugadores):
+  x_ball, y_ball = row['x'], row['y']
+  lista_original = row[columna_jugadores] if isinstance(row[columna_jugadores], list) else []
+  nueva_lista_tripletas = []
+
+  for jugador in lista_original:
+    x_jugador = jugador.get('x', np.nan)
+    y_jugador = jugador.get('y', np.nan)
+
+    if pd.isna(x_jugador) or pd.isna(y_jugador):
+      continue
+
+    is_blocking = punto_en_triangulo(x_jugador, y_jugador, x_ball, y_ball)
+    nueva_lista_tripletas.append((x_jugador, y_jugador, is_blocking))
+
+  return nueva_lista_tripletas
+
+
+shots_360_limpio['rivales_en_angulo'] = shots_360_limpio.apply(
+  lambda row: procesar_jugadores_y_angulo(row, 'posiciones_rivales'),
+  axis=1,
+)
+
+shots_360_limpio['companeros_en_angulo'] = shots_360_limpio.apply(
+  lambda row: procesar_jugadores_y_angulo(row, 'posiciones_compañeros'),
+  axis=1,
+)
+
+shots_360_limpio['num_rivales_angulo'] = shots_360_limpio['rivales_en_angulo'].apply(
+  lambda lista: sum(1 for _, _, is_blocking in lista if is_blocking)
+)
+
+shots_360_limpio['num_companeros_angulo'] = shots_360_limpio['companeros_en_angulo'].apply(
+  lambda lista: sum(1 for _, _, is_blocking in lista if is_blocking)
+)
+
+shots_360_limpio['num_jugadores_angulo'] = (
+  shots_360_limpio['num_rivales_angulo'] + shots_360_limpio['num_companeros_angulo']
+)
+
+shots_360_limpio[['num_rivales_angulo', 'num_companeros_angulo', 'num_jugadores_angulo']].head()
+```
+
+## Paso 4. Distancia al rival más cercano dentro del ángulo
+
+```{python}
+def distancia_al_jugador_mas_cercano(row, columna_jugadores):
+  x_ball, y_ball = row['x'], row['y']
+  lista_jugadores = row[columna_jugadores] if isinstance(row[columna_jugadores], list) else []
+  distancias = []
+
+  for x_jugador, y_jugador, is_blocking in lista_jugadores:
+    if is_blocking:
+      distancia = ((x_jugador - x_ball)**2 + (y_jugador - y_ball)**2)**0.5
+      distancias.append(distancia)
+
+  return min(distancias) if distancias else np.nan
+
+
+shots_360_limpio['distancia_rival_mas_cercano'] = shots_360_limpio.apply(
+  lambda row: distancia_al_jugador_mas_cercano(row, 'rivales_en_angulo'),
+  axis=1,
+)
+
+shots_360_limpio[['num_rivales_angulo', 'distancia_rival_mas_cercano']].head()
+```
+
+## Paso 5. Comprobación final de columnas guardadas
+
+```{python}
+columnas_metricas = [
+  'distancia_centro_porteria',
+  'angulo_porteria',
+  'num_rivales_angulo',
+  'num_companeros_angulo',
+  'num_jugadores_angulo',
+  'distancia_rival_mas_cercano',
+]
+
+shots_360_limpio[columnas_metricas].head()
+
+# Si prefieres usar el nombre original del DataFrame en celdas posteriores:
+all_shots_360 = shots_360_limpio.copy()
+```
+
+## Campograma de ejemplo con ángulo y rivales bloqueando
+
+```{python}
+def plot_ejemplo_angulo_rivales(df):
+  # Selecciona un tiro con al menos un rival dentro del ángulo; si no hay, usa el primero disponible
+  candidatos = df[df['num_rivales_angulo'] > 0]
+  if candidatos.empty:
+    if df.empty:
+      print('No hay tiros disponibles para visualizar.')
+      return
+    row = df.iloc[0]
+  else:
+    row = candidatos.iloc[16]
+
+  x_ball, y_ball = row['x'], row['y']
+  angulo = row['angulo_porteria']
+  distancia_centro = row['distancia_centro_porteria']
+  distancia_min = row['distancia_rival_mas_cercano']
+
+  rivales = row['rivales_en_angulo'] if isinstance(row['rivales_en_angulo'], list) else []
+  companeros = row['companeros_en_angulo'] if isinstance(row['companeros_en_angulo'], list) else []
+
+  rivales_x = [x for x, y, _ in rivales]
+  rivales_y = [y for x, y, _ in rivales]
+  companeros_x = [x for x, y, _ in companeros]
+  companeros_y = [y for x, y, _ in companeros]
+
+  rivales_block_x = [x for x, y, is_blocking in rivales if is_blocking]
+  rivales_block_y = [y for x, y, is_blocking in rivales if is_blocking]
+  companeros_block_x = [x for x, y, is_blocking in companeros if is_blocking]
+  companeros_block_y = [y for x, y, is_blocking in companeros if is_blocking]
+
+  pitch = Pitch(pitch_type='statsbomb', line_color='black', pitch_color='white')
+  fig, ax = pitch.draw(figsize=(12, 8))
+
+  # Mostrar solo la parte derecha del campo para dar efecto de zoom.
+  ax.set_xlim(65, 120)
+
+  # Triángulo visual del ángulo balón-portería
+  ax.plot([x_ball, POSTE_1[0]], [y_ball, POSTE_1[1]], color='royalblue', linewidth=2, zorder=2)
+  ax.plot([x_ball, POSTE_2[0]], [y_ball, POSTE_2[1]], color='royalblue', linewidth=2, zorder=2)
+  ax.plot([POSTE_1[0], POSTE_2[0]], [POSTE_1[1], POSTE_2[1]], color='royalblue', linewidth=2, zorder=2)
+
+  # Balón (punto de tiro)
+  pitch.scatter([x_ball], [y_ball], ax=ax, color='black', s=120, marker='o', zorder=4)
+
+  # Rivales en rojo (más intenso dentro del ángulo)
+  if len(rivales_x) > 0:
+    pitch.scatter(rivales_x, rivales_y, ax=ax, color='#ff6b6b', s=60, alpha=0.7, zorder=3)
+  if len(rivales_block_x) > 0:
+    pitch.scatter(rivales_block_x, rivales_block_y, ax=ax, color='#c1121f', edgecolors='black', s=95, zorder=4)
+
+  # Companeros en azul (más intenso dentro del ángulo)
+  if len(companeros_x) > 0:
+    pitch.scatter(companeros_x, companeros_y, ax=ax, color='#4dabf7', s=60, alpha=0.7, zorder=3)
+  if len(companeros_block_x) > 0:
+    pitch.scatter(companeros_block_x, companeros_block_y, ax=ax, color='#1d4ed8', edgecolors='black', s=95, zorder=4)
+
+  # Rival más cercano dentro del ángulo
+  if len(rivales_block_x) > 0 and pd.notna(distancia_min):
+    distancias = [((x - x_ball)**2 + (y - y_ball)**2)**0.5 for x, y in zip(rivales_block_x, rivales_block_y)]
+    idx_min = int(np.argmin(distancias))
+    x_near = rivales_block_x[idx_min]
+    y_near = rivales_block_y[idx_min]
+
+    ax.plot([x_ball, x_near], [y_ball, y_near], color='darkorange', linestyle='--', linewidth=2, zorder=3)
+    ax.text(
+      (x_ball + x_near) / 2,
+      (y_ball + y_near) / 2,
+      f"d_min={distancia_min:.2f}",
+      color='darkorange',
+      fontsize=10,
+      bbox=dict(facecolor='white', edgecolor='darkorange', alpha=0.8),
+    )
+
+  titulo = (
+    f"Ejemplo de tiro | Angulo porteria: {angulo:.2f} grados | "
+    f"Dist. centro porteria: {distancia_centro:.2f} | "
+    f"Jugadores en angulo: {int(row['num_jugadores_angulo'])}"
+  )
+  ax.set_title(titulo, fontsize=13)
+
+  plt.show()
+
+
+plot_ejemplo_angulo_rivales(shots_360_limpio)
+```

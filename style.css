@@ -1,0 +1,72 @@
+p, li {
+  text-align: justify;
+  text-justify: inter-word;
+}
+
+/* Justificar el resumen/abstract del encabezado */
+.quarto-abstract,
+.abstract,
+#abstract {
+  text-align: justify;
+  text-justify: inter-word;
+}
+
+/* Mantener los títulos alineados a la izquierda */
+.quarto-title-block,
+.quarto-title-block .title,
+.quarto-title-block .author,
+.quarto-title-block .date {
+  text-align: left !important;
+}
+
+.quarto-title-block {
+  position: relative;
+  padding-top: 120px; /* deja espacio para los logos */
+}
+
+/* Logo izquierdo */
+.quarto-title-block::before {
+  content: "";
+  background: url("URJC_logo.svg.png") no-repeat left center;
+  background-size: 120px auto;
+  position: absolute;
+  top: 5px;
+  left: 20px;
+  width: 120px;
+  height: 120px;
+}
+
+/* Logo derecho */
+.quarto-title-block::after {
+  content: "";
+  background: url("MUSA.png") no-repeat right center;
+  background-size: 100px auto;
+  position: absolute;
+  top: 15px;
+  right: 20px;
+  width: 100px;
+  height: 100px;
+}
+
+.quarto-title-block .title {
+  text-align: center !important;
+  width: 100%;
+  margin-bottom: 20px !important;
+}
+
+/* Dejar autor y fecha alineados a la izquierda */
+.quarto-title-block .author,
+.quarto-title-block .date {
+  text-align: left !important;
+}
+
+/* --- Tabla de contenidos sin justificación --- */
+#TOC, .toc, nav#TOC, .sidebar nav[role="doc-toc"] {
+  text-align: left !important;
+  text-justify: none !important;
+}
+
+#TOC * , .toc * , nav#TOC * , .sidebar nav[role="doc-toc"] * {
+  text-align: left !important;
+  text-justify: none !important;
+}
