@@ -304,3 +304,11 @@ def plot_ejemplo_angulo_rivales(df):
 
 plot_ejemplo_angulo_rivales(shots_360_limpio)
 ```
+
+## Cálculo de métrica de Probabilidad de Gol
+
+### Cálculo de Probabilidad de Gol para el Lanzador
+
+### Cálculo de Probabilidad de Gol para el resto de compañeros
+
+### Comparación entre la Probabilidad de Gol del Lanzador y la del resto de compañeros para evaluar la decisión de tiro
