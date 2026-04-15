@@ -42,9 +42,18 @@ import matplotlib.pyplot as plt
 # import seaborn as sns
 ```
 
-# Crear un DataFrame con los eventos de tiro
+# Crear un DataFrame con los eventos de tiro del Bayern Leverkusen
 ```{python}
 all_shots_360 = pd.read_parquet('data_processed/all_shots_360_processed.parquet')
+
+col_possesion = 'possesion_team_name'
+if col_possesion not in all_shots_360.columns:
+  col_possesion = 'possession_team_name'
+
+if col_possesion not in all_shots_360.columns:
+  raise ValueError('No existe la columna de posesion del equipo en el DataFrame.')
+
+all_shots_360 = all_shots_360[all_shots_360[col_possesion] == 'Bayer Leverkusen'].copy()
 
 cols_json = ['posiciones_compañeros', 'posiciones_rivales', 'posiciones_porteros']
 for col in cols_json:
@@ -229,7 +238,7 @@ def plot_ejemplo_angulo_rivales(df):
       return
     row = df.iloc[0]
   else:
-    row = candidatos.iloc[16]
+    row = candidatos.iloc[11]
 
   x_ball, y_ball = row['x'], row['y']
   angulo = row['angulo_porteria']

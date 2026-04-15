@@ -1,3 +1,8 @@
 .venv
 data/
-data_processed/
+data_processed/events
+data_processed/freeze
+data_processed/lineups
+data_processed/related
+data_processed/tactics
+data_processed/matches
